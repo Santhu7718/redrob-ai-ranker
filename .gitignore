@@ -1,0 +1,71 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# Data — large files not committed
+dataset/candidates.jsonl
+dataset/*.jsonl
+submission.csv
+
+# Secrets & credentials
+.env
+.env.*
+*.pem
+*.key
+secrets.yaml
+credentials.json
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V3
+.Trashes
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Pytest / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# Compiled docs
+docs/_build/

@@ -1,0 +1,60 @@
+name: CI — Test & Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Syntax check all Python files
+      run: |
+        python -m py_compile universal_parser.py
+        python -m py_compile universal_scorer.py
+        python -m py_compile jd_parser.py
+        python -m py_compile scorer.py
+        python -m py_compile rank.py
+        echo "✅ All files pass syntax check"
+
+    - name: Run integration test
+      run: |
+        python -c "
+        from universal_parser import parse_any_format
+        from universal_scorer import rank_candidates
+
+        csv_data = b'''Name,Years of Experience,Technical Skills,College
+        Alice,0,Python PyTorch NLP BERT Transformers,IIT Bombay
+        Bob,5,Python TensorFlow FAISS RAG Elasticsearch,NIT Trichy
+        Charlie,12,Java Spring Boot SQL REST,Anna University
+        '''
+        jd = 'NLP engineer: Python PyTorch BERT transformers RAG FAISS'
+        candidates = parse_any_format(csv_data, 'test.csv')
+        ranked, skills = rank_candidates(candidates, jd)
+        assert len(ranked) > 0, 'No candidates ranked'
+        assert ranked[0]['final_score'] > 0, 'Score should be > 0'
+        print(f'✅ Ranked {len(ranked)} candidates. Top: {ranked[0][\"name\"]} ({ranked[0][\"final_score\"]:.3f})')
+        "

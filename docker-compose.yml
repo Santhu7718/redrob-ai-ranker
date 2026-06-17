@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  ranker:
+    build: .
+    container_name: redrob-ranker
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount a folder for uploading candidate files
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1

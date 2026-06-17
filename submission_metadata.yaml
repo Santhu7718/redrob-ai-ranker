@@ -1,0 +1,60 @@
+team_name: "redrob-ai-ranker"
+
+primary_contact:
+  name: "Santhosh Kumar"
+  email: "dsanthoshkumar@example.com"
+  phone: "+91-XXXXXXXXXX"
+
+team_members:
+  - name: "Santhosh Kumar"
+    email: "dsanthoshkumar@example.com"
+    role: "ML Engineer / Team Lead"
+
+github_repo: "https://github.com/YOUR_USERNAME/redrobs-ai-ranker"
+
+sandbox_link: "https://huggingface.co/spaces/YOUR_USERNAME/redrob-ranker"
+
+reproduce_command: "python rank.py --candidates ./dataset/candidates.jsonl --out ./submission.csv"
+
+compute:
+  platform: "MacBook Pro"
+  cpu_cores: 8
+  ram_gb: 16
+  python_version: "3.11"
+  os: "macOS"
+  uses_gpu_for_inference: false
+  has_network_during_ranking: false
+  pre_computation_required: false
+  pre_computation_time_minutes: 0
+
+ai_tools_used:
+  - "Gemini (Antigravity)"
+
+ai_usage_summary: |
+  Used Gemini Antigravity for architecture discussion, code generation, and review.
+  No candidate data was fed to any external LLM during ranking.
+  The ranking system makes zero network calls and zero API calls during inference.
+  All scoring is done locally using rule-based NLP, curated skill ontologies,
+  and multi-signal weighted scoring.
+
+methodology_summary: |
+  Multi-signal hybrid scorer with zero API calls. Five scoring components:
+  (1) Skill Match (32%): Trust-weighted skill scoring using endorsements + duration
+  as anti-keyword-stuffing multipliers. Career text scanned for implicit skill evidence.
+  (2) Career Signal (25%): Title relevance tiers, product vs services firm detection,
+  ML work density in job descriptions. Penalizes irrelevant roles and pure services careers.
+  (3) Experience Fit (13%): Fresher-friendly sigmoid curve — 0 YoE starts at 0.40,
+  boosted by certs, GitHub activity, and platform assessments (up to +0.30).
+  (4) Education (10%): Institution tier, field relevance, GPA parsing, degree level.
+  Key for freshers as a potential proxy.
+  (5) Behavioral (15%): Redrob platform signals — open_to_work, last_active, response
+  rate, GitHub score, recruiter saves. Inactive/unresponsive candidates down-weighted.
+  Anti-gaming: endorsement trust multiplier, services-firm penalty, inactivity penalty.
+  Runtime: ~5-6 minutes for 90K candidates on CPU.
+
+declarations:
+  read_submission_spec: true
+  code_is_original_work: true
+  no_collusion: true
+  honeypot_check_done: true
+  reproduction_tested: true
