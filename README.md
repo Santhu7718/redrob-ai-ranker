@@ -10,6 +10,7 @@
 A fully offline, no-API, multi-signal candidate ranking system with a beautiful web UI. Upload candidate data in **any format** (Google Forms CSV, Excel, JSON) and get a ranked shortlist with full reasoning for every candidate.
 
 ---
+Live at: https://ai-resume-ranke.streamlit.app
 
 ## ✨ Features
 
@@ -58,13 +59,6 @@ docker compose up --build
 docker build -t redrob-ranker .
 docker run -p 8501:8501 redrob-ranker
 ```
-
-### Option 3 — Deploy to Streamlit Cloud (free)
-
-1. Fork this repo
-2. Go to [share.streamlit.io](https://share.streamlit.io)
-3. Connect your GitHub → select this repo → `app.py`
-4. Click **Deploy** — done!
 
 ---
 
