@@ -191,15 +191,53 @@ st.markdown("""
 left_col, right_col = st.columns([1, 1], gap="large")
 
 with left_col:
-    st.markdown("#### 📂 Upload Candidate Data")
-    uploaded_file = st.file_uploader(
-        "Drop your file here",
-        type=["csv", "xlsx", "xls", "json", "jsonl"],
-        help="Google Forms CSV, custom spreadsheet, JSON array or JSONL",
-        label_visibility="collapsed",
-    )
+    st.markdown("#### 📂 Candidate Data")
+
+    tab_upload, tab_path = st.tabs(["⬆️ Upload File (small files)", "📁 Load from Path (large files)"])
+
+    uploaded_file = None
+    local_path    = None
+
+    with tab_upload:
+        st.caption("Best for CSV / Excel / JSON under ~100 MB")
+        uploaded_file = st.file_uploader(
+            "Drop your file here",
+            type=["csv", "xlsx", "xls", "json", "jsonl"],
+            help="Google Forms CSV, spreadsheet, JSON array or JSONL",
+            label_visibility="collapsed",
+        )
+        if uploaded_file:
+            st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB")
+
+    with tab_path:
+        st.caption("Use this for large files (400 MB+) already on your computer")
+        local_path = st.text_input(
+            "Full file path",
+            placeholder="/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl",
+            label_visibility="collapsed",
+        )
+        if local_path:
+            import os
+            if os.path.isfile(local_path):
+                size_mb = os.path.getsize(local_path) / 1024 / 1024
+                st.success(f"✅ Found: **{os.path.basename(local_path)}** — {size_mb:.1f} MB")
+            else:
+                st.error("❌ File not found. Check the path and try again.")
+                local_path = None
+
+        # Quick-fill button for the challenge dataset
+        default_jsonl = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
+        if os.path.isfile(default_jsonl):
+            if st.button("📂 Use challenge dataset (candidates.jsonl)", use_container_width=True):
+                st.session_state["local_path_val"] = default_jsonl
+                st.rerun()
+        if "local_path_val" in st.session_state and not local_path:
+            local_path = st.session_state["local_path_val"]
+            size_mb = os.path.getsize(local_path) / 1024 / 1024
+            st.success(f"✅ Loaded: **candidates.jsonl** — {size_mb:.1f} MB")
+
     if uploaded_file:
-        st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size / 1024:.1f} KB loaded")
+        st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB loaded")
 
 with right_col:
     st.markdown("#### 📝 Job Description")
@@ -240,15 +278,41 @@ with btn_col:
 
 
 # ── RESULTS ────────────────────────────────────────────────────────────────────
-if run_btn and uploaded_file and jd_text.strip():
+has_file = uploaded_file is not None or (local_path is not None)
+
+if run_btn and has_file and jd_text.strip():
+    import os
 
     with st.spinner("⚙️ Parsing file and scoring candidates…"):
-        raw = uploaded_file.read()
-        candidates = parse_any_format(raw, uploaded_file.name)
+
+        if uploaded_file is not None:
+            # ── browser upload path (small files) ──
+            raw = uploaded_file.read()
+            fname = uploaded_file.name
+            candidates = parse_any_format(raw, fname)
+
+        else:
+            # ── local file path (large files, read from disk) ──
+            fname = os.path.basename(local_path)
+            ext   = os.path.splitext(fname)[1].lower()
+
+            progress_bar = st.progress(0, text="📚 Reading file from disk…")
+            file_size = os.path.getsize(local_path)
+
+            with open(local_path, "rb") as fh:
+                raw = fh.read()
+
+            progress_bar.progress(50, text="⚡ Parsing candidates…")
+            candidates = parse_any_format(raw, fname)
+            progress_bar.progress(80, text="🤖 Scoring…")
+
         if not candidates:
             st.error("❌ Could not parse the file. Check format and try again.")
             st.stop()
+
         ranked, jd_skills = rank_candidates(candidates, jd_text)
+        if 'progress_bar' in dir():
+            progress_bar.progress(100, text="✅ Done!")
 
     st.balloons()
 
@@ -435,8 +499,8 @@ if run_btn and uploaded_file and jd_text.strip():
             "skill_score":"Skill","experience_score":"Exp","education_score":"Edu",
         }), hide_index=True, use_container_width=True)
 
-elif run_btn and not uploaded_file:
-    st.warning("⚠️ Please upload a candidate file first.")
+elif run_btn and not has_file:
+    st.warning("⚠️ Please upload a file or paste a file path first.")
 elif run_btn:
     st.warning("⚠️ Please enter a job description.")
 else:
