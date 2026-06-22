@@ -1,0 +1,120 @@
+Job Title: Software & Technology Engineer (Multi-Role Hiring Drive)
+Company: RedRob Tech
+Location: India (Bangalore / Mumbai / Hyderabad / Remote)
+Type: Full-Time
+Experience: 0–10 Years (Freshers Welcome)
+
+─────────────────────────────────────────────────────────────────
+ABOUT THIS ROLE
+─────────────────────────────────────────────────────────────────
+RedRob Tech is hiring across engineering, data, and AI functions.
+We are looking for candidates who can design, build, and maintain
+software systems at scale. This is a broad-match hiring drive —
+your background in backend, frontend, data, cloud, mobile, QA,
+or AI is all valued here.
+
+─────────────────────────────────────────────────────────────────
+CORE SKILLS REQUIRED (Must Have at Least 3)
+─────────────────────────────────────────────────────────────────
+Programming Languages:
+  → Python, Java, JavaScript, TypeScript, Go, C++, .NET / C#, SQL
+
+Backend & APIs:
+  → REST APIs, Microservices, Node.js, Spring Boot, FastAPI, Django
+
+Databases:
+  → PostgreSQL, MySQL, MongoDB, Redis, Elasticsearch, Hadoop
+
+Cloud & Infrastructure:
+  → AWS, Azure, GCP
+  → Docker, Kubernetes, Terraform, CI/CD, GitHub Actions
+
+Frontend & Mobile:
+  → React, Angular, Vue.js, TypeScript, Tailwind CSS
+  → Android (Kotlin/Java), iOS (Swift), Flutter, React Native
+
+QA & Testing:
+  → Selenium, Cypress, Unit Testing, API Testing, Test Automation
+
+Data & Analytics:
+  → SQL, Spark, Kafka, Pandas, Power BI, Tableau, Excel, Hadoop
+  → ETL pipelines, Data Warehousing, Snowflake, BigQuery, dbt
+
+DevOps & Tooling:
+  → Git, Jenkins, Agile, Scrum, Jira, Confluence
+
+─────────────────────────────────────────────────────────────────
+PREFERRED / BONUS SKILLS
+─────────────────────────────────────────────────────────────────
+AI / Machine Learning Track:
+  → Machine Learning, Deep Learning, NLP, Computer Vision
+  → TensorFlow, PyTorch, Scikit-learn, Keras
+  → LLM fine-tuning, RAG, Vector Embeddings, FAISS
+  → Hugging Face, LangChain, OpenCV, Weights & Biases
+
+Business & Functional:
+  → Business Analysis, Requirements gathering, Stakeholder management
+  → SAP, Salesforce CRM, ERP systems
+  → Project Management, PMP, Agile leadership
+
+Design:
+  → Figma, Adobe XD, Photoshop, UI/UX design, Canva
+
+─────────────────────────────────────────────────────────────────
+EDUCATION
+─────────────────────────────────────────────────────────────────
+  → B.E. / B.Tech in Computer Science, IT, Electronics, or related
+  → BCA, MCA, B.Sc CS/IT/Mathematics also considered
+  → MBA with tech background considered for BA / PM roles
+  → Any engineering discipline with strong programming skills
+  → Freshers from IITs, NITs, BITS, VIT, Manipal, and other
+    reputed institutions are strongly encouraged to apply
+
+─────────────────────────────────────────────────────────────────
+EXPERIENCE
+─────────────────────────────────────────────────────────────────
+  → 0 to 10 years of total professional experience
+  → Freshers (0–2 YoE): academic projects, internships, GitHub,
+    certifications, and Kaggle/hackathon experience considered
+  → Mid-level (3–6 YoE): product or service company experience
+  → Senior (7–10 YoE): leadership, architecture, mentoring
+
+─────────────────────────────────────────────────────────────────
+CERTIFICATIONS (Valued)
+─────────────────────────────────────────────────────────────────
+  → AWS Certified (Developer / Solutions Architect / ML Specialty)
+  → Google Cloud Professional (Data Engineer / ML Engineer)
+  → Azure Fundamentals / Developer Associate
+  → Coursera / Udemy / edX courses in relevant tech
+  → DeepLearning.AI, Kaggle, fast.ai, NVIDIA DLI
+  → Scrum Master, PMP, ITIL
+
+─────────────────────────────────────────────────────────────────
+WHAT WE VALUE
+─────────────────────────────────────────────────────────────────
+  → Strong fundamentals: data structures, algorithms, system design
+  → Real-world project experience (even academic or open-source)
+  → Active GitHub profile or portfolio
+  → Problem-solving mindset over specific tool experience
+  → Team collaboration and communication skills
+  → Willingness to learn across the stack
+
+─────────────────────────────────────────────────────────────────
+RED FLAGS (Candidates Deprioritised)
+─────────────────────────────────────────────────────────────────
+  → Profile with only manual testing skills and no programming
+  → 10+ years of purely non-technical roles (HR, accounting, admin)
+  → No verifiable project, GitHub, or work experience evidence
+  → Keyword-heavy profiles with zero endorsements or context
+
+─────────────────────────────────────────────────────────────────
+ROLES BEING HIRED
+─────────────────────────────────────────────────────────────────
+  → Software Engineer (Backend / Full Stack / Frontend)
+  → Data Engineer / Data Analyst
+  → QA / Automation Engineer
+  → DevOps / Cloud Engineer
+  → Mobile Developer (Android / iOS)
+  → AI / ML Engineer
+  → Business Analyst
+  → Java / .NET Developer

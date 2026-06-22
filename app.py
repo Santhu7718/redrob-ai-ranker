@@ -1,26 +1,16 @@
 """
 app.py — RedRob AI Candidate Ranker
-====================================
-Streamlit UI for ranking candidates from ANY file format.
-
-Run with:
-    streamlit run app.py
+Streamlit UI — fixed rendering, clean layout, no raw HTML leaks.
 """
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import json
 import io
-import re
-from typing import List, Dict, Any
-
 from universal_parser import parse_any_format
-from universal_scorer import rank_candidates, _extract_skills_from_jd, _parse_yoe
+from universal_scorer import rank_candidates, _extract_skills_from_jd
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="RedRob AI Candidate Ranker",
     page_icon="🎯",
@@ -28,669 +18,453 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CUSTOM CSS — dark glassmorphism theme
-# ─────────────────────────────────────────────────────────────────────────────
+# ── GLOBAL CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Import Inter font */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-/* Base */
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif !important;
-}
+html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 
-/* Main background */
 .stApp {
-    background: linear-gradient(135deg, #0d0f1a 0%, #111827 50%, #0d0f1a 100%);
-    min-height: 100vh;
+    background: linear-gradient(135deg,#0d0f1a 0%,#111827 60%,#0d0f1a 100%);
 }
 
-/* Cards */
-.metric-card {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
-    padding: 20px;
-    text-align: center;
-    backdrop-filter: blur(10px);
-    transition: all 0.3s ease;
-}
-.metric-card:hover {
-    border-color: rgba(99,102,241,0.4);
-    background: rgba(99,102,241,0.08);
-}
-.metric-number {
-    font-size: 2.4rem;
-    font-weight: 800;
-    background: linear-gradient(135deg, #6366f1, #a78bfa);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-.metric-label {
-    color: #94a3b8;
-    font-size: 0.85rem;
-    margin-top: 4px;
-    font-weight: 500;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-}
-
-/* Header */
-.hero-header {
-    background: linear-gradient(135deg, rgba(99,102,241,0.15) 0%, rgba(167,139,250,0.1) 100%);
-    border: 1px solid rgba(99,102,241,0.2);
-    border-radius: 24px;
-    padding: 40px;
-    margin-bottom: 32px;
-    backdrop-filter: blur(20px);
-}
-.hero-title {
-    font-size: 2.8rem;
-    font-weight: 800;
-    background: linear-gradient(135deg, #e0e7ff, #a78bfa, #6366f1);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    margin: 0;
-    line-height: 1.2;
-}
-.hero-subtitle {
-    color: #94a3b8;
-    font-size: 1.1rem;
-    margin-top: 12px;
-    font-weight: 400;
-}
-
-/* Rank cards */
-.rank-card {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
-    padding: 20px 24px;
-    margin-bottom: 12px;
-    transition: all 0.25s ease;
-    position: relative;
-    overflow: hidden;
-}
-.rank-card:hover {
-    border-color: rgba(99,102,241,0.35);
-    background: rgba(99,102,241,0.05);
-    transform: translateX(4px);
-}
-.rank-card.top-3 {
-    border-color: rgba(234,179,8,0.3);
-    background: rgba(234,179,8,0.04);
-}
-.rank-card.fresher {
-    border-color: rgba(34,197,94,0.3);
-    background: rgba(34,197,94,0.04);
-}
-
-/* Score bar */
-.score-bar-bg {
-    background: rgba(255,255,255,0.06);
-    border-radius: 6px;
-    height: 8px;
-    overflow: hidden;
-    margin-top: 8px;
-}
-.score-bar-fill {
-    height: 8px;
-    border-radius: 6px;
-    background: linear-gradient(90deg, #6366f1, #a78bfa);
-    transition: width 0.8s ease;
-}
-.score-bar-fill.top-3 {
-    background: linear-gradient(90deg, #f59e0b, #fbbf24);
-}
-.score-bar-fill.fresher {
-    background: linear-gradient(90deg, #22c55e, #4ade80);
-}
-
-/* Badge */
-.badge {
-    display: inline-block;
-    padding: 3px 10px;
+/* hero banner */
+.hero {
+    background: linear-gradient(135deg,rgba(99,102,241,.18),rgba(167,139,250,.10));
+    border: 1px solid rgba(99,102,241,.25);
     border-radius: 20px;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
+    padding: 32px 36px 24px;
+    margin-bottom: 24px;
 }
-.badge-fresher {
-    background: rgba(34,197,94,0.15);
-    color: #4ade80;
-    border: 1px solid rgba(34,197,94,0.3);
+.hero h1 {
+    font-size: 2.4rem; font-weight: 800;
+    background: linear-gradient(135deg,#e0e7ff,#a78bfa,#6366f1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; margin: 0 0 8px;
 }
-.badge-top { 
-    background: rgba(234,179,8,0.15);
-    color: #fbbf24;
-    border: 1px solid rgba(234,179,8,0.3);
-}
-.badge-rank {
-    background: rgba(99,102,241,0.15);
-    color: #a78bfa;
-    border: 1px solid rgba(99,102,241,0.3);
-    min-width: 48px;
-    text-align: center;
+.hero p { color:#94a3b8; font-size:1rem; margin:0; }
+
+/* metric pill */
+.pill-row { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+.pill {
+    background:rgba(99,102,241,.12);
+    border:1px solid rgba(99,102,241,.25);
+    border-radius:30px;
+    padding:6px 16px;
+    font-size:.85rem; font-weight:600; color:#a78bfa;
 }
 
-/* How it works box */
-.how-it-works {
-    background: rgba(99,102,241,0.06);
-    border: 1px solid rgba(99,102,241,0.2);
-    border-radius: 16px;
-    padding: 24px;
+/* candidate card */
+.ccard {
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:14px;
+    padding:16px 20px 12px;
+    margin-bottom:10px;
+    transition:border-color .2s,background .2s;
 }
+.ccard:hover { border-color:rgba(99,102,241,.35); background:rgba(99,102,241,.05); }
+.ccard.gold   { border-color:rgba(234,179,8,.30); background:rgba(234,179,8,.04); }
+.ccard.green  { border-color:rgba(34,197,94,.28); background:rgba(34,197,94,.04); }
 
-/* Signal bars */
-.signal-row {
-    display: flex;
-    align-items: center;
-    margin-bottom: 6px;
-    gap: 12px;
+.rank-num { font-size:1.55rem; line-height:1; }
+.cname { font-size:1.05rem; font-weight:700; color:#e2e8f0; }
+.cmeta { font-size:.88rem; color:#94a3b8; margin:3px 0 8px; }
+.cbadge {
+    display:inline-block; padding:2px 9px; border-radius:20px;
+    font-size:.70rem; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; margin-right:5px;
 }
-.signal-label {
-    color: #94a3b8;
-    font-size: 0.78rem;
-    min-width: 80px;
-    font-weight: 500;
-}
-.signal-bar-bg {
-    flex: 1;
-    background: rgba(255,255,255,0.06);
-    border-radius: 4px;
-    height: 6px;
-}
+.b-fresh { background:rgba(34,197,94,.15); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+.b-top   { background:rgba(234,179,8,.15);  color:#fbbf24; border:1px solid rgba(234,179,8,.3); }
+.b-boost { background:rgba(99,102,241,.15); color:#a78bfa; border:1px solid rgba(99,102,241,.3); }
 
-/* Upload zone */
-.uploadedFile {
-    border-radius: 12px !important;
+/* progress bar row */
+.pbar-row { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+.pbar-label { color:#64748b; font-size:.75rem; min-width:72px; }
+.pbar-bg {
+    flex:1; background:rgba(255,255,255,.07);
+    border-radius:5px; height:6px; overflow:hidden;
 }
+.pbar-fill { height:6px; border-radius:5px; }
+.pbar-val { color:#94a3b8; font-size:.75rem; min-width:34px; text-align:right; }
+.score-big { font-size:1.1rem; font-weight:800; text-align:right; }
 
-/* Expander */
-.streamlit-expanderHeader {
-    background: rgba(255,255,255,0.03) !important;
-    border-radius: 10px !important;
+/* skill chip */
+.chip {
+    display:inline-block; padding:3px 9px; border-radius:16px;
+    font-size:.76rem; font-weight:500; margin:2px;
+    background:rgba(99,102,241,.12); color:#a78bfa;
+    border:1px solid rgba(99,102,241,.22);
 }
+.chip.matched { background:rgba(34,197,94,.12); color:#4ade80; border-color:rgba(34,197,94,.28); }
 
-/* Override Streamlit defaults */
-.stTextArea textarea {
-    background: rgba(255,255,255,0.04) !important;
-    border: 1px solid rgba(255,255,255,0.1) !important;
-    border-radius: 12px !important;
-    color: #e2e8f0 !important;
-    font-family: 'Inter', sans-serif !important;
-}
-.stButton button {
-    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 12px !important;
-    font-weight: 600 !important;
-    padding: 12px 28px !important;
-    font-size: 1rem !important;
-    transition: all 0.2s ease !important;
-    letter-spacing: 0.02em;
-}
-.stButton button:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 8px 24px rgba(99,102,241,0.4) !important;
-}
+/* section divider */
+.sdiv { border:none; border-top:1px solid rgba(255,255,255,.07); margin:18px 0; }
 
-/* Info / warning boxes */
-.stAlert {
-    border-radius: 12px !important;
+/* sidebar signal table */
+.sig-row {
+    display:flex; align-items:center; gap:8px;
+    padding:5px 0; border-bottom:1px solid rgba(255,255,255,.05);
 }
-
-div[data-testid="metric-container"] {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px;
-    padding: 12px;
+.sig-icon { font-size:1rem; min-width:22px; }
+.sig-name { color:#e2e8f0; font-size:.82rem; font-weight:600; flex:1; }
+.sig-wt {
+    background:rgba(99,102,241,.18); color:#a78bfa;
+    border-radius:10px; padding:1px 8px; font-size:.78rem; font-weight:700;
 }
+.sig-desc { color:#64748b; font-size:.76rem; margin-top:1px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — How It Works
-# ─────────────────────────────────────────────────────────────────────────────
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🧠 How the Scoring Works")
-    st.markdown("""
-<div class="how-it-works">
+    st.markdown("## 🎯 RedRob AI Ranker")
+    st.caption("Intelligent, explainable, fresher-friendly ranking")
+    st.divider()
 
-**No ML model was trained.** This is a rule-based multi-signal scoring engine — pure Python math.
+    st.markdown("### 🧠 How Scoring Works")
+    st.info("**No ML model was trained.** Pure rule-based math — every score is auditable.", icon="ℹ️")
 
-Here's exactly how each candidate gets their score:
-
----
-
-**📊 6 Scoring Signals**
-
-| Signal | Weight | What it measures |
-|--------|--------|-----------------|
-| 🎯 Skill Match | **35%** | JD skills found in candidate profile |
-| 📅 Experience | **25%** | YoE curve — freshers boosted |
-| 🎓 Education | **15%** | Institution tier + field + GPA |
-| 📋 Completeness | **10%** | How filled-in the profile is |
-| 📜 Certifications | **10%** | ML/AI upskilling evidence |
-| 🔍 Keyword Density | **5%** | Implicit JD matches across full text |
-
----
-
-**🚀 Fresher Boost**
-
-Freshers (≤2 YoE) get up to **+30% bonus** for:
-- GitHub activity
-- Certifications
-- Strong education tier
-- High skill match
-
----
-
-**🏗️ Dual-Track Ranking**
-
-- **70% slots** → Best experienced candidates
-- **30% slots** → Best freshers (guaranteed representation)
-- Final list sorted by score
-
----
-
-**⚠️ What it is NOT**
-- ❌ Not a neural network
-- ❌ Not trained on labeled data
-- ❌ No LLM / GPT calls
-- ❌ No embeddings / vectors
-
-**✅ What it IS**
-- ✅ Deterministic, explainable
-- ✅ Fully offline
-- ✅ Auditable (you can see every formula)
-- ✅ Fresher-friendly by design
-
-</div>
-""", unsafe_allow_html=True)
+    st.markdown("**6 Scoring Signals:**")
+    signals_info = [
+        ("🎯", "Skill Match",     "35%", "JD skills found in candidate profile"),
+        ("📅", "Experience",      "25%", "YoE curve — freshers boosted"),
+        ("🎓", "Education",       "15%", "Institution tier + field + GPA"),
+        ("📋", "Completeness",    "10%", "Fields filled + GitHub / LinkedIn"),
+        ("📜", "Certifications",  "10%", "ML/AI upskilling evidence"),
+        ("🔍", "Keywords",         "5%", "Implicit JD mentions across full text"),
+    ]
+    for icon, name, weight, desc in signals_info:
+        st.markdown(
+            f'<div class="sig-row">'
+            f'<span class="sig-icon">{icon}</span>'
+            f'<span class="sig-name">{name}</span>'
+            f'<span class="sig-wt">{weight}</span>'
+            f'</div>'
+            f'<div style="color:#64748b;font-size:.74rem;padding:1px 0 4px 30px;">{desc}</div>',
+            unsafe_allow_html=True,
+        )
 
     st.divider()
-    st.markdown("### 📁 Supported Formats")
+    st.markdown("### 🌱 Fresher Boost")
     st.markdown("""
-- **CSV** (Google Forms, custom)
-- **Excel** (.xlsx / .xls)
-- **JSON** (array of objects)
-- **JSONL** (challenge format)
-
-**Auto-detected columns:**
-`name, email, skills, yoe, title, company, education, college, gpa, certifications, github, location, summary`
+Candidates with **≤ 2 YoE** get up to **×1.30 bonus** for:
+- GitHub activity
+- Strong certifications
+- Top-tier institution
+- Good skill coverage
 """)
+    st.markdown("Dual-track guarantees **30 fresher slots** in the top 100.")
+
+    st.divider()
+    st.markdown("### 📂 Accepted Formats")
+    st.markdown("""
+- **CSV** — Google Forms export
+- **Excel** — .xlsx / .xls
+- **JSON** — array of objects
+- **JSONL** — challenge format
+""")
+    st.markdown("**Auto-detects** 50+ column name variants — no setup needed.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────────────────────────────────────
+# ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown("""
-<div class="hero-header">
-    <h1 class="hero-title">🎯 RedRob AI Candidate Ranker</h1>
-    <p class="hero-subtitle">
-        Upload candidate data in <strong>any format</strong> → get a ranked shortlist with full reasoning.
-        Works with Google Forms exports, custom CSVs, Excel sheets, and JSON.
-        <br>No AI black boxes — every score is fully explainable.
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INPUT SECTION
-# ─────────────────────────────────────────────────────────────────────────────
-col_upload, col_jd = st.columns([1, 1], gap="large")
-
-with col_upload:
-    st.markdown("### 📂 Upload Candidate Data")
-    st.markdown("*CSV, Excel, JSON, or JSONL — any format works*")
-    uploaded_file = st.file_uploader(
-        label="Drop your file here",
-        type=["csv", "xlsx", "xls", "json", "jsonl"],
-        help="Google Forms CSV export, custom spreadsheet, or JSON array"
-    )
-
-    if uploaded_file:
-        st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size / 1024:.1f} KB")
-
-with col_jd:
-    st.markdown("### 📝 Job Description")
-    st.markdown("*Paste the JD or describe the role — the system extracts required skills*")
-
-    DEFAULT_JD = """Senior AI Engineer — NLP & Retrieval Systems
-
-We are looking for an engineer to build our next-generation retrieval and ranking systems.
-
-Required Skills:
-- Python (3+ years)
-- NLP, transformers, BERT, LLM fine-tuning
-- Vector search: FAISS, Qdrant, Pinecone, Elasticsearch
-- LLM fine-tuning: LoRA, QLoRA, PEFT
-- RAG (Retrieval Augmented Generation)
-- Machine learning, deep learning
-- PyTorch or TensorFlow
-
-Nice to have:
-- MLOps, model deployment
-- Cloud: AWS or GCP
-- SQL, data pipelines"""
-
-    jd_text = st.text_area(
-        label="Job Description",
-        value=DEFAULT_JD,
-        height=280,
-        label_visibility="collapsed",
-        placeholder="Paste the job description here...",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RUN RANKING
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("")
-run_col, _, _ = st.columns([1, 2, 2])
-with run_col:
-    run_btn = st.button("🚀 Rank Candidates", use_container_width=True)
-
-if run_btn and uploaded_file and jd_text:
-    with st.spinner("⚙️ Parsing candidates and computing scores..."):
-        # Parse file
-        file_bytes = uploaded_file.read()
-        candidates = parse_any_format(file_bytes, uploaded_file.name)
-
-        if not candidates:
-            st.error("❌ Could not parse the file. Please check the format and try again.")
-            st.stop()
-
-        # Score & rank
-        ranked, jd_skills = rank_candidates(candidates, jd_text)
-
-    st.balloons()
-
-    # ── STATS ROW ──────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("## 📊 Ranking Complete")
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    total = len(ranked)
-    freshers = sum(1 for r in ranked if r["is_fresher"])
-    top_score = ranked[0]["final_score"] if ranked else 0
-    avg_score = sum(r["final_score"] for r in ranked) / max(1, total)
-    skills_used = len(jd_skills)
-
-    with c1:
-        st.metric("Candidates", f"{total:,}", help="Total candidates ranked")
-    with c2:
-        st.metric("Top Score", f"{top_score:.3f}", help="Highest composite score")
-    with c3:
-        st.metric("Avg Score", f"{avg_score:.3f}", help="Mean score across all candidates")
-    with c4:
-        st.metric("Freshers 🌱", f"{freshers}", help="Candidates with ≤2 YoE in shortlist")
-    with c5:
-        st.metric("JD Skills", f"{skills_used}", help="Skills extracted from JD")
-
-    # ── JD SKILLS DETECTED ─────────────────────────────────────────────────
-    with st.expander("🔍 Skills extracted from Job Description"):
-        cols = st.columns(4)
-        for i, skill in enumerate(jd_skills[:40]):
-            with cols[i % 4]:
-                st.markdown(
-                    f'<span style="background:rgba(99,102,241,0.15);color:#a78bfa;'
-                    f'padding:3px 10px;border-radius:20px;font-size:0.8rem;'
-                    f'font-weight:500;display:inline-block;margin:2px;">'
-                    f'{skill}</span>',
-                    unsafe_allow_html=True
-                )
-
-    st.markdown("---")
-
-    # ── RANKED LIST ────────────────────────────────────────────────────────
-    st.markdown("## 🏆 Ranked Candidates")
-
-    # Color scheme helper
-    def get_card_class(rank, is_fresher):
-        if rank <= 3:
-            return "top-3"
-        if is_fresher:
-            return "fresher"
-        return ""
-
-    def rank_emoji(rank):
-        return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"#{rank}")
-
-    def score_color(score):
-        if score >= 0.75:
-            return "#22c55e"
-        if score >= 0.55:
-            return "#6366f1"
-        if score >= 0.35:
-            return "#f59e0b"
-        return "#ef4444"
-
-    def pct(score):
-        return f"{score * 100:.0f}%"
-
-    for r in ranked:
-        card_class = get_card_class(r["rank"], r["is_fresher"])
-        bar_class = card_class if card_class else ""
-
-        with st.container():
-            st.markdown(f"""
-<div class="rank-card {card_class}">
-  <div style="display:flex; align-items:flex-start; gap:16px;">
-    <div style="min-width:52px; text-align:center;">
-      <div style="font-size:1.6rem;">{rank_emoji(r['rank'])}</div>
-      <div style="color:#64748b;font-size:0.72rem;font-weight:600;">RANK</div>
-    </div>
-    <div style="flex:1;">
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px;">
-        <span style="font-size:1.1rem;font-weight:700;color:#e2e8f0;">
-          {r.get('name') or r.get('candidate_id','—')}
-        </span>
-        {'<span class="badge badge-top">TOP 3</span>' if r["rank"] <= 3 else ""}
-        {'<span class="badge badge-fresher">🌱 FRESHER</span>' if r["is_fresher"] else ""}
-        {'<span style="color:#fbbf24;font-size:0.8rem;font-weight:600">× {:.2f} BOOST</span>'.format(r["fresher_uplift"]) if r["fresher_uplift"] > 1.0 else ""}
-      </div>
-      <div style="color:#94a3b8;font-size:0.9rem;margin-bottom:8px;">
-        {r.get('title','—')}
-        {' @ <strong style="color:#c4b5fd;">' + r['company'] + '</strong>' if r.get('company') else ''}
-        {' &nbsp;•&nbsp; ' + str(r['yoe']) + ' YoE' if r.get('yoe') is not None else ''}
-        {' &nbsp;•&nbsp; 📍' + r['location'] if r.get('location') else ''}
-      </div>
-      <div class="score-bar-bg">
-        <div class="score-bar-fill {bar_class}" style="width:{pct(r['final_score'])};"></div>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-top:6px;">
-        <div style="font-size:0.78rem;color:#64748b;">
-          🎯 {pct(r['skill_score'])} skill &nbsp;
-          📅 {pct(r['experience_score'])} exp &nbsp;
-          🎓 {pct(r['education_score'])} edu &nbsp;
-          📜 {pct(r['certification_score'])} certs
-        </div>
-        <div style="font-size:1rem;font-weight:700;color:{score_color(r['final_score'])};">
-          {r['final_score']:.4f}
-        </div>
-      </div>
-    </div>
+<div class="hero">
+  <h1>🎯 RedRob AI Candidate Ranker</h1>
+  <p>Upload candidate data in <strong>any format</strong> and get a ranked shortlist
+     with full, explainable reasoning — no APIs, no black boxes.</p>
+  <div class="pill-row">
+    <span class="pill">📂 CSV · Excel · JSON · JSONL</span>
+    <span class="pill">🧠 6-Signal Scoring</span>
+    <span class="pill">🌱 Fresher-Friendly</span>
+    <span class="pill">🔒 100% Offline</span>
+    <span class="pill">💾 Export CSV / JSON</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-        # Expandable reasoning
-        with st.expander(f"📋 Why #{r['rank']}? — Full scoring breakdown"):
-            ra, rb = st.columns([1, 1])
 
-            with ra:
-                st.markdown("**🎯 Signal Scores**")
-                signals = [
-                    ("Skill Match", r["skill_score"], "🎯"),
-                    ("Experience Fit", r["experience_score"], "📅"),
-                    ("Education", r["education_score"], "🎓"),
-                    ("Completeness", r["completeness_score"], "📋"),
-                    ("Certifications", r["certification_score"], "📜"),
-                    ("Keyword Density", r["keyword_score"], "🔍"),
+# ── INPUT ROW ──────────────────────────────────────────────────────────────────
+left_col, right_col = st.columns([1, 1], gap="large")
+
+with left_col:
+    st.markdown("#### 📂 Upload Candidate Data")
+    uploaded_file = st.file_uploader(
+        "Drop your file here",
+        type=["csv", "xlsx", "xls", "json", "jsonl"],
+        help="Google Forms CSV, custom spreadsheet, JSON array or JSONL",
+        label_visibility="collapsed",
+    )
+    if uploaded_file:
+        st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size / 1024:.1f} KB loaded")
+
+with right_col:
+    st.markdown("#### 📝 Job Description")
+    DEFAULT_JD = """Software / AI Engineer (General Tech Hiring)
+
+We are hiring across engineering, data, AI, and product roles.
+
+Core Skills Required:
+- Python or Java or JavaScript or Go
+- REST APIs, Microservices, SQL
+- Cloud platforms: AWS or Azure or GCP
+- Agile / Scrum methodologies
+- Problem-solving and system design
+
+Preferred / Additional Skills:
+- Machine learning, NLP, or data science
+- DevOps: Docker, Kubernetes, CI/CD
+- Frontend: React, TypeScript
+- Data engineering: Spark, Kafka, Hadoop
+- Mobile: Android or iOS development
+
+Education: Any engineering or CS background
+Experience: 0–10 years (freshers welcome)
+Location: India preferred, open to remote"""
+
+    jd_text = st.text_area(
+        "Job Description",
+        value=DEFAULT_JD,
+        height=260,
+        label_visibility="collapsed",
+    )
+
+# ── RUN BUTTON ─────────────────────────────────────────────────────────────────
+st.markdown("")
+btn_col, _ = st.columns([1, 4])
+with btn_col:
+    run_btn = st.button("🚀 Rank Candidates", type="primary", use_container_width=True)
+
+
+# ── RESULTS ────────────────────────────────────────────────────────────────────
+if run_btn and uploaded_file and jd_text.strip():
+
+    with st.spinner("⚙️ Parsing file and scoring candidates…"):
+        raw = uploaded_file.read()
+        candidates = parse_any_format(raw, uploaded_file.name)
+        if not candidates:
+            st.error("❌ Could not parse the file. Check format and try again.")
+            st.stop()
+        ranked, jd_skills = rank_candidates(candidates, jd_text)
+
+    st.balloons()
+
+    # ── STATS ─────────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("## 📊 Ranking Complete")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Candidates", f"{len(ranked):,}")
+    m2.metric("Top Score",  f"{ranked[0]['final_score']:.3f}" if ranked else "—")
+    m3.metric("Avg Score",  f"{sum(r['final_score'] for r in ranked)/max(1,len(ranked)):.3f}")
+    m4.metric("Freshers 🌱", sum(1 for r in ranked if r["is_fresher"]))
+    m5.metric("JD Skills",  len(jd_skills))
+
+    # ── JD SKILLS CHIPS ───────────────────────────────────────────
+    with st.expander("🔍 Skills extracted from Job Description", expanded=False):
+        chip_html = "".join(
+            f'<span class="chip">{s}</span>' for s in jd_skills[:50]
+        )
+        st.markdown(chip_html, unsafe_allow_html=True)
+        st.caption(f"{len(jd_skills)} skills identified from the job description text.")
+
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+
+    # ── RANKED LIST ───────────────────────────────────────────────
+    st.markdown("## 🏆 Ranked Candidates")
+
+    RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    def score_bar_color(score):
+        if score >= 0.75: return "#22c55e"
+        if score >= 0.55: return "#6366f1"
+        if score >= 0.35: return "#f59e0b"
+        return "#ef4444"
+
+    def pct_str(score):
+        return f"{score*100:.0f}%"
+
+    for r in ranked:
+        rank = r["rank"]
+        is_fresh = r["is_fresher"]
+        is_top3  = rank <= 3
+
+        card_class = "gold" if is_top3 else ("green" if is_fresh else "")
+        rank_label = RANK_EMOJI.get(rank, f"#{rank}")
+
+        # badges
+        badges = ""
+        if is_top3:
+            badges += '<span class="cbadge b-top">⭐ Top 3</span>'
+        if is_fresh:
+            badges += '<span class="cbadge b-fresh">🌱 Fresher</span>'
+        if r["fresher_uplift"] > 1.0:
+            badges += f'<span class="cbadge b-boost">×{r["fresher_uplift"]:.2f} Boost</span>'
+
+        # meta line
+        name     = r.get("name") or r.get("candidate_id", "—")
+        title    = r.get("title", "")
+        company  = r.get("company", "")
+        location = r.get("location", "")
+        yoe_val  = r.get("yoe", "")
+
+        meta_parts = []
+        if title:   meta_parts.append(title)
+        if company: meta_parts.append(f"@ {company}")
+        if yoe_val is not None and yoe_val != "": meta_parts.append(f"• {yoe_val} YoE")
+        if location: meta_parts.append(f"• 📍 {location}")
+        meta_str = "  ".join(meta_parts)
+
+        # signal mini-bars (HTML)
+        bar_color = score_bar_color(r["final_score"])
+        signals_html = ""
+        for sig_name, sig_key, sig_color in [
+            ("Skill",  "skill_score",          "#6366f1"),
+            ("Exp",    "experience_score",      "#22c55e"),
+            ("Edu",    "education_score",       "#f59e0b"),
+            ("Certs",  "certification_score",   "#a78bfa"),
+        ]:
+            sv = r.get(sig_key, 0)
+            signals_html += (
+                f'<div class="pbar-row">'
+                f'<span class="pbar-label">{sig_name}</span>'
+                f'<div class="pbar-bg"><div class="pbar-fill" '
+                f'style="width:{pct_str(sv)};background:{sig_color};"></div></div>'
+                f'<span class="pbar-val">{pct_str(sv)}</span>'
+                f'</div>'
+            )
+
+        card_html = f"""
+<div class="ccard {card_class}">
+  <div style="display:flex;gap:16px;align-items:flex-start;">
+    <div style="min-width:48px;text-align:center;padding-top:2px;">
+      <div class="rank-num">{rank_label}</div>
+    </div>
+    <div style="flex:1;min-width:0;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+        <span class="cname">{name}</span>
+        {badges}
+      </div>
+      <div class="cmeta">{meta_str}</div>
+      {signals_html}
+    </div>
+    <div style="min-width:64px;text-align:right;">
+      <div class="score-big" style="color:{bar_color};">{r['final_score']:.4f}</div>
+      <div style="color:#64748b;font-size:.72rem;margin-top:2px;">Score</div>
+    </div>
+  </div>
+</div>
+"""
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        # Expandable breakdown
+        with st.expander(f"📋 Why #{rank}? — Full scoring breakdown"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**Signal Breakdown**")
+                sigs = [
+                    ("🎯 Skill Match",    r["skill_score"],          "#6366f1"),
+                    ("📅 Experience",     r["experience_score"],     "#22c55e"),
+                    ("🎓 Education",      r["education_score"],      "#f59e0b"),
+                    ("📋 Completeness",   r["completeness_score"],   "#94a3b8"),
+                    ("📜 Certifications", r["certification_score"],  "#a78bfa"),
+                    ("🔍 Keywords",       r["keyword_score"],        "#64748b"),
                 ]
-                for name, score, icon in signals:
-                    filled = int(score * 20)
-                    bar = "█" * filled + "░" * (20 - filled)
-                    color = score_color(score)
+                for sig_label, sig_val, sig_col in sigs:
+                    filled = int(sig_val * 20)
+                    bar_s  = "█" * filled + "░" * (20 - filled)
                     st.markdown(
-                        f'{icon} **{name}**: '
-                        f'<span style="font-family:monospace;color:{color}">{bar}</span> '
-                        f'`{score:.3f}`',
-                        unsafe_allow_html=True
+                        f'{sig_label}: <code style="color:{sig_col}">{bar_s}</code> '
+                        f'`{sig_val:.3f}`',
+                        unsafe_allow_html=True,
                     )
+                if r["fresher_uplift"] > 1.0:
+                    st.success(f"🚀 Fresher Boost applied: ×{r['fresher_uplift']:.3f}")
 
-                if r["is_fresher"] and r["fresher_uplift"] > 1.0:
-                    st.markdown(
-                        f'🚀 **Fresher Boost**: `×{r["fresher_uplift"]:.3f}` '
-                        f'(high-potential signals detected)',
-                    )
+            with col_b:
+                st.markdown("**Reasoning**")
+                for chunk in r.get("reasoning", "").split(" || "):
+                    if ":" in chunk:
+                        tag, _, detail = chunk.partition(": ")
+                        st.markdown(f"**{tag}**: {detail}")
 
-            with rb:
-                st.markdown("**📝 Reasoning**")
-                for line in r["reasoning"].split(" || "):
-                    if line.strip():
-                        tag, _, detail = line.partition(": ")
-                        st.markdown(f"- **{tag}**: {detail}")
-
-    # ── DOWNLOAD BUTTON ────────────────────────────────────────────────────
-    st.markdown("---")
+    # ── DOWNLOAD ──────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
     st.markdown("### 💾 Download Results")
 
-    export_rows = []
-    for r in ranked:
-        export_rows.append({
-            "rank": r["rank"],
-            "candidate_id": r["candidate_id"],
-            "name": r.get("name", ""),
-            "title": r.get("title", ""),
-            "company": r.get("company", ""),
-            "location": r.get("location", ""),
-            "yoe": r.get("yoe", ""),
-            "is_fresher": r["is_fresher"],
-            "final_score": r["final_score"],
-            "skill_score": r["skill_score"],
-            "experience_score": r["experience_score"],
-            "education_score": r["education_score"],
-            "completeness_score": r["completeness_score"],
-            "certification_score": r["certification_score"],
-            "keyword_score": r["keyword_score"],
-            "fresher_uplift": r["fresher_uplift"],
-            "skill_match_detail": r["skill_match_detail"],
-            "experience_detail": r["experience_detail"],
-            "education_detail": r["education_detail"],
-            "certification_detail": r["certification_detail"],
-            "reasoning": r["reasoning"],
-        })
+    rows = [{
+        "rank": r["rank"], "candidate_id": r["candidate_id"],
+        "name": r.get("name",""), "title": r.get("title",""),
+        "company": r.get("company",""), "location": r.get("location",""),
+        "yoe": r.get("yoe",""), "is_fresher": r["is_fresher"],
+        "final_score": r["final_score"],
+        "skill_score": r["skill_score"], "experience_score": r["experience_score"],
+        "education_score": r["education_score"], "completeness_score": r["completeness_score"],
+        "certification_score": r["certification_score"], "keyword_score": r["keyword_score"],
+        "fresher_uplift": r["fresher_uplift"],
+        "skill_match_detail": r["skill_match_detail"],
+        "experience_detail": r["experience_detail"],
+        "education_detail": r["education_detail"],
+        "certification_detail": r["certification_detail"],
+        "reasoning": r["reasoning"],
+    } for r in ranked]
 
-    df_export = pd.DataFrame(export_rows)
-    csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+    df_exp = pd.DataFrame(rows)
+    dc1, dc2, _ = st.columns([1, 1, 2])
+    with dc1:
+        st.download_button("⬇️ Download CSV",
+            df_exp.to_csv(index=False).encode(),
+            "ranked_candidates.csv", "text/csv",
+            use_container_width=True)
+    with dc2:
+        st.download_button("⬇️ Download JSON",
+            json.dumps(rows, indent=2, default=str).encode(),
+            "ranked_candidates.json", "application/json",
+            use_container_width=True)
 
-    dl_col1, dl_col2, _ = st.columns([1, 1, 2])
-    with dl_col1:
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=csv_bytes,
-            file_name="ranked_candidates.csv",
-            mime="text/csv",
-        )
-    with dl_col2:
-        json_bytes = json.dumps(export_rows, indent=2, default=str).encode()
-        st.download_button(
-            label="⬇️ Download JSON",
-            data=json_bytes,
-            file_name="ranked_candidates.json",
-            mime="application/json",
-        )
-
-    # ── TABLE VIEW ────────────────────────────────────────────────────────
     with st.expander("📊 View as Table"):
-        display_df = df_export[[
-            "rank", "name", "title", "company", "yoe",
-            "is_fresher", "final_score",
-            "skill_score", "experience_score", "education_score"
+        st.dataframe(df_exp[[
+            "rank","name","title","company","yoe","is_fresher",
+            "final_score","skill_score","experience_score","education_score",
         ]].rename(columns={
-            "rank": "Rank", "name": "Name", "title": "Title",
-            "company": "Company", "yoe": "YoE",
-            "is_fresher": "Fresher?", "final_score": "Score",
-            "skill_score": "Skill", "experience_score": "Exp", "education_score": "Edu",
-        })
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Score": st.column_config.ProgressColumn(
-                    "Score", min_value=0, max_value=1, format="%.3f"
-                ),
-                "Skill": st.column_config.ProgressColumn(
-                    "Skill", min_value=0, max_value=1, format="%.2f"
-                ),
-                "Exp": st.column_config.ProgressColumn(
-                    "Exp", min_value=0, max_value=1, format="%.2f"
-                ),
-                "Edu": st.column_config.ProgressColumn(
-                    "Edu", min_value=0, max_value=1, format="%.2f"
-                ),
-            }
-        )
+            "rank":"Rank","name":"Name","title":"Title","company":"Company",
+            "yoe":"YoE","is_fresher":"Fresher?","final_score":"Score",
+            "skill_score":"Skill","experience_score":"Exp","education_score":"Edu",
+        }), hide_index=True, use_container_width=True)
 
 elif run_btn and not uploaded_file:
-    st.warning("⚠️ Please upload a candidate data file first.")
-elif run_btn and not jd_text.strip():
+    st.warning("⚠️ Please upload a candidate file first.")
+elif run_btn:
     st.warning("⚠️ Please enter a job description.")
 else:
-    # Initial state — show sample data format
-    st.markdown("---")
+    # ── GETTING STARTED ───────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
     st.markdown("### 👋 Getting Started")
+    ga, gb = st.columns(2)
+    with ga:
+        st.markdown("**Sample Google Forms CSV columns:**")
+        st.dataframe(pd.DataFrame({
+            "Your Name":             ["Priya Sharma",  "Rahul Mehta"],
+            "Years of Experience":   ["0",             "5"],
+            "Technical Skills":      ["Python, PyTorch, NLP", "Python, FAISS, MLOps"],
+            "College / University":  ["IIT Bombay",    "NIT Trichy"],
+            "CGPA / Percentage":     ["9.2 CGPA",      "75%"],
+            "Certifications":        ["DeepLearning.AI", "AWS ML Specialty"],
+            "GitHub Profile":        ["github.com/ps", "github.com/rm"],
+        }), hide_index=True, use_container_width=True)
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**📄 Sample Google Forms CSV structure:**")
-        sample_df = pd.DataFrame({
-            "Timestamp": ["2024-01-15 10:30:00", "2024-01-15 11:00:00"],
-            "Your Name": ["Priya Sharma", "Rahul Mehta"],
-            "Email Address": ["priya@example.com", "rahul@example.com"],
-            "Years of Experience": ["0", "3"],
-            "Current Role / Title": ["Student", "ML Engineer"],
-            "Technical Skills": [
-                "Python, PyTorch, NLP, Transformers, BERT",
-                "Python, TensorFlow, MLOps, FAISS, RAG"
-            ],
-            "College / University": ["IIT Delhi", "NIT Trichy"],
-            "CGPA / Percentage": ["9.2 CGPA", "78%"],
-            "Certifications": [
-                "Deep Learning Specialization (Coursera)",
-                "AWS ML Specialty"
-            ],
-            "GitHub Profile": [
-                "github.com/priyasharma", "github.com/rahulmehta"
-            ],
-        })
-        st.dataframe(sample_df, use_container_width=True, hide_index=True)
-
-    with col_b:
-        st.markdown("**🎯 What you'll get:**")
+    with gb:
+        st.markdown("**What you'll get per candidate:**")
         st.markdown("""
-- **Ranked list** with score breakdowns
-- **Visual score bars** for each signal
-- **Full reasoning** — exactly why each candidate ranked where they did
-- **Fresher tracking** — guaranteed representation
-- **Downloadable CSV/JSON** results
-
-**✨ Smart column detection — no setup needed!**
-The system auto-detects:
-`name` / `your name` / `candidate name` → `name`
-`yoe` / `years of experience` / `work experience` → `yoe`
-`skills` / `technical skills` / `technologies` → `skills`
-...and 50+ more aliases
+- 🏆 **Final rank** (1–N) with composite score
+- 🎯 **Skill match %** — which JD skills were found
+- 📅 **Experience score** — YoE curve with fresher boost
+- 🎓 **Education score** — institution tier + GPA
+- 📜 **Certification score** — ML upskilling signals
+- 📋 **Full reasoning** — every score explained in plain text
+- 💾 **Downloadable** CSV + JSON output
 """)
+        st.info("The system auto-detects column names — no manual mapping needed.", icon="✨")
