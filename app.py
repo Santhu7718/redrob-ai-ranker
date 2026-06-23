@@ -8,6 +8,7 @@ import pandas as pd
 import json
 import io
 import os
+import html as html_mod
 from universal_parser import parse_any_format
 from universal_scorer import rank_candidates, _extract_skills_from_jd
 
@@ -219,6 +220,25 @@ with left_col:
 
         DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
 
+        # ── Security: allowed extensions and base directories ──
+        ALLOWED_EXTS  = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
+        ALLOWED_BASES = [
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Documents"),
+            "/tmp",
+        ]
+
+        def _safe_path(p):
+            """Return (ok, reason) — True only if ext and base dir are whitelisted."""
+            p = os.path.realpath(p)          # resolve symlinks / traversal
+            ext = os.path.splitext(p)[1].lower()
+            if ext not in ALLOWED_EXTS:
+                return False, f"File type `{ext}` not allowed. Use: {', '.join(sorted(ALLOWED_EXTS))}"
+            if not any(p.startswith(b) for b in ALLOWED_BASES):
+                return False, f"Path must be inside Desktop, Downloads, or Documents."
+            return True, ""
+
         # One-click quick-fill button — stores path in session_state
         if os.path.isfile(DEFAULT_JSONL):
             if st.button("📂 Use challenge dataset  (candidates.jsonl — 465 MB)",
@@ -238,15 +258,19 @@ with left_col:
         # Validate and expose
         _raw_path = st.session_state["local_path_val"]
         if _raw_path:
-            if os.path.isfile(_raw_path):
+            ok, reason = _safe_path(_raw_path)
+            if not ok:
+                st.error(f"❌ {reason}")
+                local_path = None
+            elif os.path.isfile(os.path.realpath(_raw_path)):
                 size_mb = os.path.getsize(_raw_path) / 1024 / 1024
                 st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
-                local_path = _raw_path          # ← valid path confirmed
+                local_path = os.path.realpath(_raw_path)   # canonical safe path
             else:
-                st.error(f"❌ File not found:\n`{_raw_path}`\nCheck the path and try again.")
-                local_path = None               # ← invalid, block ranking
+                st.error(f"❌ File not found:\n`{_raw_path}`")
+                local_path = None
         else:
-            local_path = None                   # ← nothing typed, block ranking
+            local_path = None
 
 
 with right_col:
@@ -377,10 +401,11 @@ if run_btn and has_file and jd_text.strip():
             badges += f'<span class="cbadge b-boost">×{r["fresher_uplift"]:.2f} Boost</span>'
 
         # meta line
-        name     = r.get("name") or r.get("candidate_id", "—")
-        title    = r.get("title", "")
-        company  = r.get("company", "")
-        location = r.get("location", "")
+        # ── XSS protection: escape ALL user-supplied data before HTML rendering ──
+        name     = html_mod.escape(r.get("name") or r.get("candidate_id", "—"))
+        title    = html_mod.escape(r.get("title", ""))
+        company  = html_mod.escape(r.get("company", ""))
+        location = html_mod.escape(r.get("location", ""))
         yoe_val  = r.get("yoe", "")
 
         meta_parts = []
@@ -509,8 +534,8 @@ if run_btn and has_file and jd_text.strip():
 
 elif run_btn and not has_file:
     st.warning("⚠️ Please upload a file or paste a file path first.")
-elif run_btn:
-    st.warning("⚠️ Please enter a job description.")
+elif run_btn and not jd_text.strip():
+    st.warning("⚠️ Please enter a job description before ranking.")
 else:
     # ── GETTING STARTED ───────────────────────────────────────────
     st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
