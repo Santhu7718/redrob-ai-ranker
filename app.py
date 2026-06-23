@@ -1,606 +1,1194 @@
 """
-app.py — ICD (Intelligent Candidate Discovery AI)
-Streamlit Cloud deployment.
-
-Strategy:
-  - Read web/index.html exactly as-is
-  - Inline web/styles.css (replace <link rel="stylesheet">)
-  - Inject an auto-resize postMessage script so the iframe fills the page
-  - Replace the Flask fetch() calls in main.js with a stub that shows
-    the upload UI visually but posts a message to the Streamlit parent
-  - Below the component: real Streamlit file_uploader + Python ranking
+app.py — RedRob AI Candidate Ranker
+Streamlit UI — fixed rendering, clean layout, no raw HTML leaks.
 """
-import streamlit as st
-import streamlit.components.v1 as components
-import os, json, time, io, html as _html
-import pandas as pd
-from pathlib import Path
-import re
 
-# ── Page Config ───────────────────────────────────────────────────────────────
+import streamlit as st
+import pandas as pd
+import json
+import io
+import os
+import html as html_mod
+import time
+import hashlib
+from universal_parser import parse_any_format
+from universal_scorer import rank_candidates, _extract_skills_from_jd
+
+# ── MEMOISED WRAPPERS ──────────────────────────────────────────────────────────
+# st.cache_data persists across reruns for the same cache key.
+# parse: keyed on (file_bytes, filename) — Streamlit auto-hashes bytes.
+# rank:  keyed on a stable tuple from the parsed candidates + jd_text.
+# For LOCAL PATH files (400MB+), we avoid re-hashing the giant byte array
+# by using (realpath, mtime, size) as an O(1) cache key instead.
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_bytes(raw: bytes, filename: str) -> list:
+    """Parse file bytes → list of candidate dicts. Cached by file content hash."""
+    return parse_any_format(raw, filename)
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_path(realpath: str, _mtime: float, _size: int, filename: str) -> list:
+    """
+    Parse a large on-disk file WITHOUT loading its full bytes into the cache key.
+    Cache key = (realpath, mtime, size) — O(1) stat call instead of O(n) hash.
+    _mtime and _size are prefixed with _ so Streamlit skips hashing them (they
+    are already primitive types embedded in the key).
+    """
+    with open(realpath, "rb") as fh:
+        raw = fh.read()
+    return parse_any_format(raw, filename)
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def _cached_rank(candidates_json: str, jd_text: str) -> tuple:
+    """
+    Rank candidates. Cache key = (serialised candidates, jd_text).
+    Candidates are serialised to a compact JSON string so the list-of-dicts
+    is hashable and change-aware.
+    """
+    import json as _json
+    cands = _json.loads(candidates_json)
+    return rank_candidates(cands, jd_text)
+
+def _serialise_candidates(cands: list) -> str:
+    """Compact JSON for cache key — stable sort by candidate_id."""
+    return json.dumps(
+        sorted(cands, key=lambda c: c.get("candidate_id", "")),
+        sort_keys=True, separators=(',', ':')
+    )
+
+
+# ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ICD — Intelligent Candidate Discovery AI",
+    page_title="RedRob AI Candidate Ranker",
     page_icon="🎯",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
-# ── Read assets ───────────────────────────────────────────────────────────────
-BASE = Path(__file__).parent
-WEB  = BASE / "web"
-HTML_FILE = WEB / "index.html"
-CSS_FILE  = WEB / "styles.css"
-
-html_src = HTML_FILE.read_text(encoding="utf-8")
-css_src  = CSS_FILE.read_text(encoding="utf-8")
-
-# ── Build the full inline HTML ────────────────────────────────────────────────
-# 1. Replace <link rel="stylesheet" href="styles.css"> with inline <style>
-#    (so the component is self-contained — no external file requests)
-inline_html = re.sub(
-    r'<link[^>]*styles\.css[^>]*>',
-    f'<style>\n{css_src}\n</style>',
-    html_src,
-    flags=re.IGNORECASE
-)
-
-# 2. Remove the <script src="main.js"></script> — we'll inject a slim stub
-#    that keeps all the visual/animation JS but rewires the ranking calls
-STUB_JS = r"""
-<script>
-// ═══════════════════════════════════════════════════════════════════════
-//  Streamlit Compatibility Stub
-//  - Keeps all animations, nav, copy-buttons, scroll-reveal, etc.
-//  - Replaces Flask fetch() calls with a postMessage to the parent
-//    so Streamlit can handle the actual ranking in Python
-// ═══════════════════════════════════════════════════════════════════════
-
-// Auto-resize the Streamlit iframe to match this page height
-function _sendHeight() {
-  const h = Math.max(
-    document.documentElement.scrollHeight,
-    document.body.scrollHeight
-  );
-  window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: h }, "*");
-}
-window.addEventListener("load", () => { setTimeout(_sendHeight, 200); });
-window.addEventListener("resize", _sendHeight);
-new MutationObserver(_sendHeight).observe(document.body, { subtree: true, childList: true, attributes: true });
-
-// ── Navbar scroll shrink ──────────────────────────────────────────────
-(function initNavbar() {
-  const navbar = document.getElementById("navbar");
-  let last = 0;
-  function onScroll() {
-    const y = window.scrollY;
-    if (navbar) {
-      navbar.classList.toggle("navbar--scrolled", y > 60);
-      navbar.classList.toggle("navbar--hidden", y > last + 80 && y > 200);
-      navbar.classList.remove("navbar--hidden");
-    }
-    last = y;
-  }
-  window.addEventListener("scroll", onScroll, { passive: true });
-})();
-
-// ── Copy buttons ──────────────────────────────────────────────────────
-(function initCopyButtons() {
-  document.querySelectorAll(".copy-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const text = btn.dataset.clipboard;
-      if (!text) return;
-      navigator.clipboard.writeText(text).then(() => {
-        btn.classList.add("copied");
-        setTimeout(() => btn.classList.remove("copied"), 1800);
-        const toast = document.getElementById("toast");
-        if (toast) { toast.classList.add("toast--visible"); setTimeout(() => toast.classList.remove("toast--visible"), 2200); }
-      });
-    });
-  });
-})();
-
-// ── Scroll reveal ─────────────────────────────────────────────────────
-(function initScrollReveal() {
-  const obs = new IntersectionObserver(entries => {
-    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add("visible"); obs.unobserve(e.target); } });
-  }, { threshold: 0.1 });
-  document.querySelectorAll(".pipeline-step, .score-card, .arch-card, .results-item, .run-step").forEach(el => obs.observe(el));
-})();
-
-// ── Weight bar animation ──────────────────────────────────────────────
-(function initWeightBar() {
-  const wb = document.querySelector(".weight-bar");
-  if (!wb) return;
-  const obs = new IntersectionObserver(entries => {
-    entries.forEach(e => {
-      if (e.isIntersecting) {
-        wb.querySelectorAll(".weight-segment").forEach((s, i) => {
-          setTimeout(() => s.classList.add("animated"), i * 80);
-        });
-        obs.unobserve(wb);
-      }
-    });
-  }, { threshold: 0.3 });
-  obs.observe(wb);
-})();
-
-// ── Upload section: tell Streamlit parent to scroll to/show the uploader
-(function initUploadSection() {
-  const startBtn = document.getElementById("startRankBtn");
-  const btnDefault = document.getElementById("btnDefault");
-  const btnUpload  = document.getElementById("btnUpload");
-  const dropZoneWrapper = document.getElementById("dropZoneWrapper");
-  const fileInput = document.getElementById("fileInput");
-  const dropZone  = document.getElementById("dropZone");
-
-  // Source selector
-  [btnDefault, btnUpload].forEach(btn => {
-    btn?.addEventListener("click", () => {
-      const src = btn.dataset.source;
-      btnDefault?.classList.toggle("source-btn--active", src === "default");
-      btnDefault?.setAttribute("aria-pressed", (src === "default").toString());
-      btnUpload?.classList.toggle("source-btn--active", src === "upload");
-      btnUpload?.setAttribute("aria-pressed", (src === "upload").toString());
-      if (dropZoneWrapper) dropZoneWrapper.style.display = src === "upload" ? "block" : "none";
-    });
-  });
-
-  // When Start Ranking is clicked → post to parent (Streamlit will handle)
-  startBtn?.addEventListener("click", () => {
-    // Scroll parent to the Streamlit upload section
-    window.parent.postMessage({ type: "icd:scrollToUpload" }, "*");
-    // Show a friendly banner in this page too
-    const hint = document.createElement("div");
-    hint.style.cssText = "position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#f43f5e;color:#fff;font-family:Inter,sans-serif;font-weight:700;font-size:.9rem;padding:14px 28px;border-radius:12px;z-index:9999;box-shadow:0 8px 32px rgba(244,63,94,.4);animation:fadeInUp .3s ease";
-    hint.textContent = "⬇  Scroll down to upload your file in the Streamlit panel below";
-    document.body.appendChild(hint);
-    setTimeout(() => hint.remove(), 3500);
-  });
-
-  // File input change
-  const dropZoneIdle = document.getElementById("dropZoneIdle");
-  const dropZoneFile = document.getElementById("dropZoneFile");
-  const selName = document.getElementById("selectedFileName");
-  const selSize = document.getElementById("selectedFileSize");
-  const clearBtn = document.getElementById("clearFile");
-
-  fileInput?.addEventListener("change", e => {
-    const f = e.target.files[0];
-    if (!f) return;
-    if (dropZoneIdle) dropZoneIdle.style.display = "none";
-    if (dropZoneFile) dropZoneFile.style.display = "flex";
-    if (selName) selName.textContent = f.name;
-    if (selSize) selSize.textContent = (f.size / 1024 / 1024).toFixed(1) + " MB";
-  });
-
-  clearBtn?.addEventListener("click", e => {
-    e.stopPropagation();
-    if (fileInput) fileInput.value = "";
-    if (dropZoneIdle) dropZoneIdle.style.display = "block";
-    if (dropZoneFile) dropZoneFile.style.display = "none";
-  });
-
-  dropZone?.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("drag-over"); });
-  dropZone?.addEventListener("dragleave", () => dropZone?.classList.remove("drag-over"));
-  dropZone?.addEventListener("drop", e => {
-    e.preventDefault();
-    dropZone?.classList.remove("drag-over");
-    const f = e.dataTransfer.files[0];
-    if (f && fileInput) { fileInput.files = e.dataTransfer.files; fileInput.dispatchEvent(new Event("change")); }
-  });
-  dropZone?.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") fileInput?.click(); });
-})();
-
-// ── Smooth scroll ─────────────────────────────────────────────────────
-document.querySelectorAll('a[href^="#"]').forEach(a => {
-  a.addEventListener("click", e => {
-    const id = a.getAttribute("href").slice(1);
-    const el = document.getElementById(id);
-    if (el) { e.preventDefault(); el.scrollIntoView({ behavior: "smooth", block: "start" }); }
-  });
-});
-</script>
-"""
-
-inline_html = re.sub(
-    r'<script[^>]*main\.js[^>]*></script>',
-    STUB_JS,
-    inline_html,
-    flags=re.IGNORECASE
-)
-
-# 3. Fix Google Fonts — keep the preconnect + font link as-is (they work fine)
-# ── Streamlit chrome hiding + upload panel CSS ────────────────────────────────
-CHROME_HIDE_CSS = """
+# ── GLOBAL CSS — Complete Design System ───────────────────────────────────────
+st.markdown("""
 <style>
-/* Kill Streamlit chrome */
-#MainMenu, footer,
-header[data-testid="stHeader"],
-.stDeployButton,
-[data-testid="stToolbar"],
-[data-testid="stDecoration"],
-[data-testid="stStatusWidget"] { display: none !important; }
-section[data-testid="stSidebar"] { display: none !important; }
-.block-container, .stMainBlockContainer, .stMain > div {
-  padding: 0 !important;
-  max-width: 100% !important;
-  margin: 0 !important;
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — DESIGN TOKENS
+═══════════════════════════════════════════════════════════════════ */
+:root {
+  /* Backgrounds */
+  --bg-base:      #080B14;
+  --bg-surface:   #0F1220;
+  --bg-elevated:  #161B2E;
+  --bg-glass:     rgba(15,18,32,0.75);
+
+  /* Brand */
+  --primary:      #6366F1;
+  --primary-dim:  rgba(99,102,241,0.15);
+  --primary-glow: rgba(99,102,241,0.40);
+  --secondary:    #A78BFA;
+  --secondary-dim:rgba(167,139,250,0.12);
+
+  /* Semantic */
+  --success:      #22C55E; --success-dim: rgba(34,197,94,0.14);
+  --warning:      #F59E0B; --warning-dim: rgba(245,158,11,0.14);
+  --error:        #EF4444; --error-dim:   rgba(239,68,68,0.14);
+  --gold:         #EAB308; --gold-dim:    rgba(234,179,8,0.10);
+
+  /* Text */
+  --text-1: #E2E8F0;
+  --text-2: #94A3B8;
+  --text-3: #475569;
+
+  /* Borders */
+  --border:       rgba(255,255,255,0.07);
+  --border-hover: rgba(99,102,241,0.45);
+
+  /* Radius */
+  --r-sm: 8px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px;
+
+  /* Typography */
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
-/* Upload panel below the component */
-.icd-upload-panel {
-  background: #0d0f1a;
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — TYPOGRAPHY & BASE
+═══════════════════════════════════════════════════════════════════ */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+html, body, [class*="css"], .stApp, .stMarkdown, p, span, div {
+  font-family: var(--font) !important;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — APP BACKGROUND (animated mesh gradient)
+═══════════════════════════════════════════════════════════════════ */
+.stApp {
+  background:
+    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(99,102,241,0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 110%, rgba(167,139,250,0.09) 0%, transparent 55%),
+    radial-gradient(ellipse 100% 80% at 50% 50%, #080B14 0%, #080B14 100%);
   min-height: 100vh;
-  padding: 60px 24px 80px;
-  font-family: 'Inter', -apple-system, sans-serif;
 }
-.icd-section-badge {
-  display: inline-block;
-  background: rgba(244,63,94,.12);
-  border: 1px solid rgba(244,63,94,.25);
-  color: #f43f5e;
-  font-size: .78rem;
-  font-weight: 700;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  padding: 6px 16px;
-  border-radius: 999px;
-  margin-bottom: 16px;
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — SIDEBAR
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #0C0F1E 0%, #080B14 100%) !important;
+  border-right: 1px solid var(--border) !important;
 }
-.icd-heading {
-  font-size: clamp(1.6rem, 4vw, 2.4rem);
-  font-weight: 800;
-  color: #f1f5f9;
+[data-testid="stSidebar"] > div { padding: 0 !important; }
+[data-testid="stSidebarContent"] { padding: 20px 16px 24px !important; }
+
+/* Sidebar headings */
+[data-testid="stSidebar"] h2 {
+  font-size: 1.1rem !important; font-weight: 800 !important;
+  color: var(--text-1) !important; margin: 0 0 2px !important;
+  letter-spacing: -.01em;
+}
+[data-testid="stSidebar"] h3 {
+  font-size: .82rem !important; font-weight: 700 !important;
+  color: var(--secondary) !important;
+  text-transform: uppercase; letter-spacing: .08em;
+  margin: 18px 0 10px !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — HERO BANNER
+═══════════════════════════════════════════════════════════════════ */
+.hero {
+  position: relative; overflow: hidden;
+  background: linear-gradient(135deg, rgba(99,102,241,.16) 0%, rgba(167,139,250,.08) 100%);
+  border: 1px solid rgba(99,102,241,.28);
+  border-radius: var(--r-xl);
+  padding: 40px 44px 32px;
+  margin-bottom: 28px;
+}
+.hero::before {
+  content: ''; position: absolute;
+  top: -60px; right: -60px;
+  width: 220px; height: 220px;
+  background: radial-gradient(circle, rgba(99,102,241,.18) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero::after {
+  content: ''; position: absolute;
+  bottom: -40px; left: 30%;
+  width: 160px; height: 160px;
+  background: radial-gradient(circle, rgba(167,139,250,.12) 0%, transparent 70%);
+  pointer-events: none;
+}
+.hero h1 {
+  font-size: 2.5rem; font-weight: 900; letter-spacing: -.03em;
+  background: linear-gradient(135deg, #E0E7FF 0%, #A78BFA 50%, #6366F1 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin: 0 0 10px; line-height: 1.15;
+}
+.hero p {
+  color: var(--text-2); font-size: 1rem; font-weight: 400;
+  line-height: 1.65; margin: 0 0 18px; max-width: 580px;
+}
+
+/* Feature pills row */
+.pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: rgba(99,102,241,.10);
+  border: 1px solid rgba(99,102,241,.25);
+  border-radius: 30px;
+  padding: 5px 14px;
+  font-size: .78rem; font-weight: 600; color: var(--secondary);
+  letter-spacing: .01em;
+  transition: background .2s, border-color .2s;
+}
+.pill:hover { background: rgba(99,102,241,.18); border-color: rgba(99,102,241,.45); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — SECTION LABEL
+═══════════════════════════════════════════════════════════════════ */
+.section-label {
+  font-size: .72rem; font-weight: 700; letter-spacing: .10em;
+  text-transform: uppercase; color: var(--text-3);
   margin: 0 0 8px;
-  letter-spacing: -.03em;
 }
-.icd-sub {
-  color: #94a3b8;
-  font-size: 1rem;
-  margin: 0 0 32px;
-  max-width: 600px;
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — INPUT PANELS (glassmorphism)
+═══════════════════════════════════════════════════════════════════ */
+.input-panel {
+  background: rgba(15,18,32,0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 20px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: border-color .25s;
 }
+.input-panel:hover { border-color: rgba(99,102,241,.25); }
+
+/* Streamlit tab bar */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+  background: rgba(255,255,255,.03) !important;
+  border-radius: var(--r-md) var(--r-md) 0 0 !important;
+  border-bottom: 1px solid var(--border) !important;
+  gap: 0 !important; padding: 0 4px !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+  background: transparent !important;
+  border: none !important; border-radius: 0 !important;
+  color: var(--text-2) !important;
+  font-size: .83rem !important; font-weight: 600 !important;
+  padding: 10px 16px !important;
+  transition: color .2s !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"]:hover { color: var(--text-1) !important; }
+[data-testid="stTabs"] [aria-selected="true"] {
+  color: var(--secondary) !important;
+  border-bottom: 2px solid var(--primary) !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab-panel"] {
+  background: rgba(15,18,32,.45) !important;
+  border: 1px solid var(--border) !important;
+  border-top: none !important;
+  border-radius: 0 0 var(--r-md) var(--r-md) !important;
+  padding: 16px !important;
+}
+
+/* Streamlit text inputs */
+[data-testid="stTextInput"] > div > div > input,
+[data-testid="stTextArea"] > div > div > textarea {
+  background: rgba(8,11,20,.6) !important;
+  border: 1px solid rgba(255,255,255,.10) !important;
+  border-radius: var(--r-sm) !important;
+  color: var(--text-1) !important;
+  font-family: var(--font) !important;
+  font-size: .9rem !important;
+  transition: border-color .2s, box-shadow .2s !important;
+}
+[data-testid="stTextInput"] > div > div > input:focus,
+[data-testid="stTextArea"] > div > div > textarea:focus {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 3px rgba(99,102,241,.20) !important;
+  outline: none !important;
+}
+
 /* File uploader */
-[data-testid="stFileUploaderDropzone"] {
-  min-height: 120px;
-  background: rgba(255,255,255,.02) !important;
-  border: 2px dashed rgba(255,255,255,.10) !important;
-  border-radius: 14px !important;
+[data-testid="stFileUploader"] > div {
+  background: rgba(8,11,20,.5) !important;
+  border: 1.5px dashed rgba(99,102,241,.35) !important;
+  border-radius: var(--r-md) !important;
+  padding: 20px !important;
   transition: border-color .2s, background .2s !important;
 }
-[data-testid="stFileUploaderDropzone"]:hover {
-  border-color: rgba(244,63,94,.35) !important;
-  background: rgba(244,63,94,.04) !important;
+[data-testid="stFileUploader"] > div:hover {
+  border-color: rgba(99,102,241,.65) !important;
+  background: rgba(99,102,241,.06) !important;
 }
-[data-testid="stFileUploaderDropzone"] p,
-[data-testid="stFileUploaderDropzone"] span,
-[data-testid="stFileUploaderDropzone"] small {
-  color: #64748b !important;
-  font-family: 'Inter', sans-serif !important;
-}
-div[data-testid="stFileUploader"] section {
-  background: transparent !important;
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 6 — PRIMARY BUTTON (CTA — Rank Candidates)
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stButton"] button[kind="primary"] {
+  background: linear-gradient(135deg, #6366F1 0%, #7C3AED 100%) !important;
   border: none !important;
-  padding: 0 !important;
+  border-radius: var(--r-sm) !important;
+  color: #FFFFFF !important;
+  font-size: .95rem !important; font-weight: 700 !important;
+  letter-spacing: .01em;
+  padding: 14px 28px !important;
+  box-shadow: 0 4px 20px rgba(99,102,241,.35), 0 1px 0 rgba(255,255,255,.1) inset !important;
+  transition: all .2s ease !important;
+  position: relative; overflow: hidden;
 }
-/* Button */
-.stButton > button {
-  background: linear-gradient(135deg, #f43f5e, #be123c) !important;
-  color: #fff !important;
-  border: none !important;
-  border-radius: 12px !important;
-  padding: 14px 32px !important;
-  font-family: 'Inter', sans-serif !important;
-  font-size: 1rem !important;
-  font-weight: 700 !important;
-  letter-spacing: -.01em !important;
-  transition: all .2s !important;
-  width: 100%;
-  min-height: 52px;
+[data-testid="stButton"] button[kind="primary"]::before {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(135deg, rgba(255,255,255,.08) 0%, transparent 60%);
+  pointer-events: none;
 }
-.stButton > button:hover {
+[data-testid="stButton"] button[kind="primary"]:hover {
   transform: translateY(-2px) !important;
-  box-shadow: 0 8px 24px rgba(244,63,94,.35) !important;
+  box-shadow: 0 8px 32px rgba(99,102,241,.50), 0 1px 0 rgba(255,255,255,.15) inset !important;
 }
-/* Text area */
-.stTextArea textarea {
-  background: rgba(255,255,255,.03) !important;
-  border: 1px solid rgba(255,255,255,.10) !important;
-  border-radius: 12px !important;
-  color: #e2e8f0 !important;
-  font-family: 'Inter', sans-serif !important;
+[data-testid="stButton"] button[kind="primary"]:active {
+  transform: translateY(0) !important;
+  box-shadow: 0 2px 8px rgba(99,102,241,.30) !important;
 }
-.stTextArea textarea:focus {
-  border-color: rgba(244,63,94,.4) !important;
-  box-shadow: 0 0 0 3px rgba(244,63,94,.08) !important;
+[data-testid="stButton"] button[kind="primary"]:focus-visible {
+  outline: 3px solid rgba(99,102,241,.6) !important;
+  outline-offset: 3px !important;
 }
-.stTextArea label { color: #94a3b8 !important; font-family: 'Inter', sans-serif !important; }
-/* Labels */
-.stFileUploader label { color: #94a3b8 !important; font-family: 'Inter', sans-serif !important; }
 
-/* Result cards */
-.r-card {
-  background: rgba(255,255,255,.03);
-  border: 1px solid rgba(255,255,255,.08);
-  border-radius: 14px;
-  padding: 20px 24px;
-  margin-bottom: 12px;
-  font-family: 'Inter', sans-serif;
-  transition: border-color .2s;
+/* Secondary buttons */
+[data-testid="stButton"] button[kind="secondary"] {
+  background: rgba(255,255,255,.04) !important;
+  border: 1px solid rgba(255,255,255,.12) !important;
+  border-radius: var(--r-sm) !important;
+  color: var(--text-1) !important;
+  font-size: .86rem !important; font-weight: 600 !important;
+  transition: all .2s !important;
 }
-.r-card:hover { border-color: rgba(244,63,94,.25); }
-.r-card.top3  { border-color: rgba(234,179,8,.30); background: rgba(234,179,8,.04); }
-.r-card.fresh { border-color: rgba(34,197,94,.28); background: rgba(34,197,94,.04); }
-.r-name  { font-size: 1.05rem; font-weight: 700; color: #e2e8f0; }
-.r-meta  { font-size: .85rem; color: #94a3b8; margin-top: 3px; }
-.r-score { font-size: 1.15rem; font-weight: 800; text-align: right; }
-.r-score-sub { font-size: .72rem; color: #64748b; text-align: right; margin-top: 2px; }
-.r-badge { display:inline-block;padding:2px 9px;border-radius:20px;font-size:.70rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-right:5px; }
-.b-fresh { background:rgba(34,197,94,.15);color:#4ade80;border:1px solid rgba(34,197,94,.3); }
-.b-top   { background:rgba(234,179,8,.15); color:#fbbf24;border:1px solid rgba(234,179,8,.3); }
-.b-boost { background:rgba(99,102,241,.15);color:#a78bfa;border:1px solid rgba(99,102,241,.3); }
-.mbar { display:flex;align-items:center;gap:8px;margin:3px 0; }
-.mbar-label { color:#64748b;font-size:.75rem;min-width:56px; }
-.mbar-bg { flex:1;background:rgba(255,255,255,.06);border-radius:4px;height:5px;overflow:hidden; }
-.mbar-fill { height:5px;border-radius:4px; }
-.mbar-val { color:#94a3b8;font-size:.72rem;min-width:34px;text-align:right; }
-.sum-grid { display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px; }
-.sum-card { background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:14px;padding:20px 16px;text-align:center; }
-.sum-val { font-size:1.8rem;font-weight:800;color:#f43f5e;font-family:'Inter',sans-serif; }
-.sum-label { font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-top:4px; }
-@media(max-width:640px) { .sum-grid { grid-template-columns:repeat(2,1fr); } }
+[data-testid="stButton"] button[kind="secondary"]:hover {
+  background: rgba(99,102,241,.10) !important;
+  border-color: rgba(99,102,241,.40) !important;
+  color: var(--secondary) !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — CANDIDATE RANK CARDS
+═══════════════════════════════════════════════════════════════════ */
+.ccard {
+  position: relative; overflow: hidden;
+  background: rgba(15,18,32,.7);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 18px 22px 14px;
+  margin-bottom: 10px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: border-color .25s, background .25s, transform .2s, box-shadow .25s;
+  cursor: default;
+}
+.ccard::before {
+  content: ''; position: absolute;
+  left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--primary); border-radius: 3px 0 0 3px;
+  opacity: 0; transition: opacity .25s;
+}
+.ccard:hover {
+  border-color: var(--border-hover);
+  background: rgba(99,102,241,.06);
+  transform: translateX(3px);
+  box-shadow: 0 4px 24px rgba(0,0,0,.4), 0 0 0 1px rgba(99,102,241,.15);
+}
+.ccard:hover::before { opacity: 1; }
+
+/* Gold — top 3 */
+.ccard.gold {
+  border-color: rgba(234,179,8,.30);
+  background: rgba(234,179,8,.05);
+}
+.ccard.gold::before { background: var(--gold); }
+.ccard.gold:hover { border-color: rgba(234,179,8,.55); box-shadow: 0 4px 24px rgba(234,179,8,.12); }
+
+/* Green — freshers */
+.ccard.green {
+  border-color: rgba(34,197,94,.25);
+  background: rgba(34,197,94,.04);
+}
+.ccard.green::before { background: var(--success); }
+
+/* Rank badge */
+.rank-num {
+  font-size: 1.6rem; line-height: 1; font-weight: 900;
+  letter-spacing: -.04em;
+}
+
+/* Candidate name */
+.cname {
+  font-size: 1.05rem; font-weight: 700;
+  color: var(--text-1); letter-spacing: -.01em;
+}
+
+/* Meta line (title, company, YoE) */
+.cmeta {
+  font-size: .84rem; color: var(--text-2);
+  margin: 4px 0 10px; line-height: 1.5;
+}
+
+/* Badges */
+.cbadge {
+  display: inline-flex; align-items: center;
+  padding: 2px 9px; border-radius: 20px;
+  font-size: .68rem; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; margin-right: 5px;
+  vertical-align: middle;
+}
+.b-fresh { background: var(--success-dim); color: #4ADE80; border: 1px solid rgba(34,197,94,.30); }
+.b-top   { background: var(--gold-dim);    color: #FBBF24; border: 1px solid rgba(234,179,8,.30); }
+.b-boost { background: var(--primary-dim); color: var(--secondary); border: 1px solid rgba(99,102,241,.30); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — SIGNAL PROGRESS BARS (animated)
+═══════════════════════════════════════════════════════════════════ */
+.pbar-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 5px;
+}
+.pbar-label {
+  color: var(--text-3); font-size: .73rem; font-weight: 600;
+  min-width: 42px; text-transform: uppercase; letter-spacing: .04em;
+}
+.pbar-bg {
+  flex: 1; background: rgba(255,255,255,.06);
+  border-radius: 4px; height: 5px; overflow: hidden;
+}
+.pbar-fill {
+  height: 5px; border-radius: 4px;
+  animation: barGrow .6s cubic-bezier(.22,1,.36,1) forwards;
+  transform-origin: left;
+}
+@keyframes barGrow {
+  from { transform: scaleX(0); opacity: .4; }
+  to   { transform: scaleX(1); opacity: 1; }
+}
+.pbar-val {
+  color: var(--text-2); font-size: .73rem; font-weight: 600;
+  min-width: 36px; text-align: right;
+}
+.score-big {
+  font-size: 1.15rem; font-weight: 900;
+  letter-spacing: -.03em; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — SKILL CHIPS
+═══════════════════════════════════════════════════════════════════ */
+.chip {
+  display: inline-flex; align-items: center;
+  padding: 3px 10px; border-radius: 20px;
+  font-size: .74rem; font-weight: 500; margin: 2px 2px 2px 0;
+  background: var(--primary-dim); color: var(--secondary);
+  border: 1px solid rgba(99,102,241,.20);
+  transition: background .15s, border-color .15s;
+}
+.chip:hover { background: rgba(99,102,241,.22); border-color: rgba(99,102,241,.40); }
+.chip.matched {
+  background: var(--success-dim); color: #4ADE80;
+  border-color: rgba(34,197,94,.28);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — REASONING EXPANDER
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stExpander"] {
+  background: rgba(8,11,20,.5) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--r-sm) !important;
+  margin-top: 10px !important;
+}
+[data-testid="stExpander"]:hover {
+  border-color: rgba(99,102,241,.30) !important;
+}
+[data-testid="stExpander"] summary {
+  color: var(--text-2) !important;
+  font-size: .82rem !important; font-weight: 600 !important;
+  padding: 10px 14px !important;
+}
+[data-testid="stExpander"] summary:hover { color: var(--secondary) !important; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — METRICS ROW
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="metric-container"] {
+  background: var(--bg-surface) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--r-md) !important;
+  padding: 16px !important;
+  transition: border-color .2s !important;
+}
+[data-testid="metric-container"]:hover {
+  border-color: rgba(99,102,241,.30) !important;
+}
+[data-testid="stMetricLabel"] { color: var(--text-3) !important; font-size: .76rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: .07em; }
+[data-testid="stMetricValue"] { color: var(--text-1) !important; font-size: 1.6rem !important; font-weight: 800 !important; letter-spacing: -.03em; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — DOWNLOAD BUTTONS
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stDownloadButton"] button {
+  background: rgba(255,255,255,.04) !important;
+  border: 1px solid rgba(255,255,255,.12) !important;
+  border-radius: var(--r-sm) !important;
+  color: var(--text-1) !important;
+  font-weight: 600 !important; font-size: .86rem !important;
+  transition: all .2s !important;
+}
+[data-testid="stDownloadButton"] button:hover {
+  background: var(--success-dim) !important;
+  border-color: rgba(34,197,94,.40) !important;
+  color: #4ADE80 !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — ALERT / INFO / SUCCESS / WARNING BOXES
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stAlert"] {
+  border-radius: var(--r-sm) !important;
+  border-left-width: 3px !important;
+  font-size: .88rem !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — SECTION DIVIDER
+═══════════════════════════════════════════════════════════════════ */
+.sdiv {
+  border: none; border-top: 1px solid var(--border);
+  margin: 22px 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — SIDEBAR SCORING SIGNALS
+═══════════════════════════════════════════════════════════════════ */
+.sig-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.04);
+}
+.sig-icon { font-size: .95rem; min-width: 20px; }
+.sig-name {
+  color: var(--text-1); font-size: .80rem; font-weight: 600;
+  flex: 1; letter-spacing: -.01em;
+}
+.sig-wt {
+  background: var(--primary-dim); color: var(--secondary);
+  border-radius: 10px; padding: 1px 8px;
+  font-size: .74rem; font-weight: 700; letter-spacing: .02em;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — SCROLLBAR
+═══════════════════════════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(99,102,241,.30); border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,.55); }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — STREAMLIT CHROME CLEANUP
+═══════════════════════════════════════════════════════════════════ */
+#MainMenu, footer, header { visibility: hidden; }
+[data-testid="stToolbar"] { display: none; }
+.block-container {
+  padding: 28px 32px 48px !important;
+  max-width: 1280px !important;
+}
+
+/* Streamlit select/radio */
+[data-testid="stRadio"] label, [data-testid="stSelectbox"] label {
+  color: var(--text-2) !important; font-size: .84rem !important; font-weight: 500 !important;
+}
+[data-testid="stSelectbox"] > div > div {
+  background: rgba(8,11,20,.6) !important;
+  border-color: rgba(255,255,255,.10) !important;
+  border-radius: var(--r-sm) !important;
+  color: var(--text-1) !important;
+}
+[data-testid="stDataFrame"] {
+  border-radius: var(--r-md) !important;
+  overflow: hidden !important;
+  border: 1px solid var(--border) !important;
+}
+
+/* Caption / help text */
+[data-testid="stCaptionContainer"] p {
+  color: var(--text-3) !important; font-size: .78rem !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 3 — FOCUS (WCAG 2.2 AA)
+═══════════════════════════════════════════════════════════════════ */
+*:focus-visible {
+  outline: 2px solid rgba(99,102,241,.7) !important;
+  outline-offset: 3px !important;
+  border-radius: 4px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 6 — MICRO-ANIMATIONS
+═══════════════════════════════════════════════════════════════════ */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0   rgba(99,102,241,.35); }
+  70%  { box-shadow: 0 0 0 10px rgba(99,102,241,.00); }
+  100% { box-shadow: 0 0 0 0   rgba(99,102,241,.00); }
+}
+.ccard { animation: fadeUp .35s ease both; }
+.ccard:nth-child(2) { animation-delay: .05s; }
+.ccard:nth-child(3) { animation-delay: .10s; }
+.ccard:nth-child(4) { animation-delay: .15s; }
+.ccard:nth-child(5) { animation-delay: .20s; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 5 — FORM FIELD LABELS (Streamlit)
+═══════════════════════════════════════════════════════════════════ */
+[data-testid="stTextInput"] label, [data-testid="stTextArea"] label,
+[data-testid="stFileUploader"] label {
+  color: var(--text-2) !important;
+  font-size: .80rem !important; font-weight: 600 !important;
+  letter-spacing: .01em; text-transform: uppercase;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 8 — RESPONSIVE (Mobile-first)
+═══════════════════════════════════════════════════════════════════ */
+@media (max-width: 768px) {
+  .hero { padding: 24px 20px 20px; }
+  .hero h1 { font-size: 1.65rem; }
+  .hero p { font-size: .88rem; }
+  .block-container { padding: 16px 12px 32px !important; }
+  .ccard { padding: 14px 14px 10px; }
+  .rank-num { font-size: 1.25rem; }
+  .score-big { font-size: .95rem; }
+}
+@media (max-width: 480px) {
+  .hero h1 { font-size: 1.35rem; }
+  .pill { font-size: .70rem; padding: 4px 10px; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — RESULTS SECTION HEADER
+═══════════════════════════════════════════════════════════════════ */
+.results-header {
+  display: flex; align-items: center; gap: 12px;
+  margin: 24px 0 16px;
+}
+.results-header h2 {
+  font-size: 1.35rem; font-weight: 800;
+  color: var(--text-1); letter-spacing: -.02em; margin: 0;
+}
+.results-badge {
+  background: var(--primary-dim);
+  border: 1px solid rgba(99,102,241,.28);
+  border-radius: 20px; padding: 3px 12px;
+  font-size: .75rem; font-weight: 700;
+  color: var(--secondary); letter-spacing: .03em;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — GETTING STARTED (empty state)
+═══════════════════════════════════════════════════════════════════ */
+.empty-state {
+  text-align: center; padding: 48px 24px;
+  border: 1.5px dashed rgba(255,255,255,.08);
+  border-radius: var(--r-lg);
+  margin-top: 16px;
+}
+.empty-state .es-icon { font-size: 2.5rem; margin-bottom: 12px; }
+.empty-state h3 { font-size: 1.1rem; font-weight: 700; color: var(--text-1); margin: 0 0 8px; }
+.empty-state p { color: var(--text-2); font-size: .88rem; line-height: 1.65; max-width: 420px; margin: 0 auto; }
+
+/* ═══════════════════════════════════════════════════════════════════
+   PHASE 4 — CACHE BANNER (hit/miss)
+═══════════════════════════════════════════════════════════════════ */
+.cache-hit  { border-left: 3px solid var(--success) !important; }
+.cache-miss { border-left: 3px solid var(--warning) !important; }
 </style>
-"""
-
-# ── Render ────────────────────────────────────────────────────────────────────
-st.markdown(CHROME_HIDE_CSS, unsafe_allow_html=True)
-
-# Full page as component — auto-resizes via postMessage
-components.html(inline_html, height=6000, scrolling=False)
-
-# ════════════════════════════════════════════════════════════════════════════
-#  STREAMLIT UPLOAD + RANKING PANEL
-#  (Appears below the full-page component as a seamless continuation)
-# ════════════════════════════════════════════════════════════════════════════
-st.markdown("""
-<div class="icd-upload-panel" id="streamlit-upload">
-  <div style="max-width:900px;margin:0 auto;">
-    <div class="icd-section-badge">⚡ Upload &amp; Score</div>
-    <h2 class="icd-heading">Upload Your Candidates File</h2>
-    <p class="icd-sub">
-      Drop your file below — CSV, Excel, JSON, JSONL or TXT.
-      The ranking engine auto-detects columns and scores every candidate.
-    </p>
-  </div>
-</div>
 """, unsafe_allow_html=True)
 
-with st.container():
-    inner_col, _ = st.columns([10, 1])
-    with inner_col:
-        col_file, col_jd = st.columns([1, 1], gap="large")
 
-        with col_file:
-            st.markdown(
-                '<p style="font-family:Inter,sans-serif;font-weight:600;'
-                'color:#e2e8f0;margin-bottom:8px;">📂 Candidates File</p>',
-                unsafe_allow_html=True
-            )
-            uploaded = st.file_uploader(
-                "candidates_file",
-                type=["csv", "xlsx", "xls", "json", "jsonl", "txt"],
-                label_visibility="collapsed",
-                help="Auto-detects any format — CSV, Excel, JSON, JSONL, TXT",
-            )
-            if uploaded:
-                size_mb = uploaded.size / 1024 / 1024
-                st.success(f"✅ **{uploaded.name}** — {size_mb:.1f} MB")
 
-        with col_jd:
-            st.markdown(
-                '<p style="font-family:Inter,sans-serif;font-weight:600;'
-                'color:#e2e8f0;margin-bottom:8px;">📝 Job Description</p>',
-                unsafe_allow_html=True
-            )
-            DEFAULT_JD = """Software / AI Engineer — RedRob Tech
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🎯 RedRob AI Ranker")
+    st.caption("Intelligent, explainable, fresher-friendly ranking")
+    st.divider()
 
-Core Skills:
-- Python, Machine Learning, Deep Learning
-- PyTorch or TensorFlow, scikit-learn
-- NLP, Computer Vision, LLMs
-- REST APIs, SQL, Git
+    st.markdown("### 🧠 How Scoring Works")
+    st.info("**No ML model was trained.** Pure rule-based math — every score is auditable.", icon="ℹ️")
 
-Preferred:
-- MLOps: Docker, Kubernetes, CI/CD
-- Cloud: AWS / GCP / Azure
-- Data Engineering: Spark, Pandas
-
-Experience: 0–10 years (freshers welcome)
-Location: Bangalore · Mumbai · Hyderabad · Remote"""
-            jd_text = st.text_area(
-                "jd_text",
-                value=DEFAULT_JD,
-                height=220,
-                label_visibility="collapsed",
-            )
-
-        st.markdown("<br/>", unsafe_allow_html=True)
-        run_col, _ = st.columns([2, 5])
-        with run_col:
-            run_btn = st.button("▶  Start Ranking", type="primary", use_container_width=True)
-
-# ── Ranking ───────────────────────────────────────────────────────────────────
-if run_btn:
-    if not uploaded:
-        st.warning("⚠️ Please upload a candidates file first.")
-    elif not jd_text.strip():
-        st.warning("⚠️ Please enter a job description.")
-    else:
-        with st.spinner("⚡ Parsing candidates and running multi-signal scoring…"):
-            t0 = time.perf_counter()
-            try:
-                from universal_parser import parse_any_format
-                from universal_scorer import rank_candidates, _extract_skills_from_jd
-                raw        = uploaded.read()
-                candidates = parse_any_format(raw, uploaded.name)
-                if not candidates:
-                    st.error("❌ Could not parse file. Check the format and try again.")
-                    st.stop()
-                ranked, jd_skills = rank_candidates(candidates, jd_text)
-                elapsed = time.perf_counter() - t0
-            except Exception as e:
-                st.error(f"❌ Ranking failed: {e}")
-                st.stop()
-
-        freshers  = sum(1 for r in ranked if r.get("is_fresher"))
-        avg_score = sum(r["final_score"] for r in ranked) / max(1, len(ranked))
-
-        # ── Summary ──────────────────────────────────────────────────────────
-        st.markdown(f"""
-<div style="max-width:900px;margin:0 auto 0;font-family:Inter,sans-serif">
-  <h2 style="font-size:1.8rem;font-weight:800;color:#f1f5f9;margin:24px 0 20px;letter-spacing:-.03em">
-    🏆 Ranking Complete
-  </h2>
-  <div class="sum-grid">
-    <div class="sum-card"><div class="sum-val">{len(candidates):,}</div><div class="sum-label">Total Candidates</div></div>
-    <div class="sum-card"><div class="sum-val">{len(ranked)}</div><div class="sum-label">Top Ranked</div></div>
-    <div class="sum-card"><div class="sum-val">{freshers}</div><div class="sum-label">Freshers in Top {len(ranked)}</div></div>
-    <div class="sum-card"><div class="sum-val">{avg_score:.3f}</div><div class="sum-label">Avg Score ({elapsed:.0f}s)</div></div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-        # ── JD skills ────────────────────────────────────────────────────────
-        if jd_skills:
-            with st.expander(f"🔍 {len(jd_skills)} skills found in Job Description"):
-                chips = "".join(
-                    f'<span style="display:inline-block;background:rgba(99,102,241,.12);color:#a78bfa;'
-                    f'border:1px solid rgba(99,102,241,.22);border-radius:16px;padding:3px 10px;'
-                    f'font-size:.76rem;font-family:Inter,sans-serif;margin:3px;">{s}</span>'
-                    for s in jd_skills[:60]
-                )
-                st.markdown(chips, unsafe_allow_html=True)
-
-        # ── Results ───────────────────────────────────────────────────────────
-        RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
-        def score_color(s):
-            if s >= 0.75: return "#4ade80"
-            if s >= 0.55: return "#a78bfa"
-            if s >= 0.35: return "#fbbf24"
-            return "#f87171"
-
-        for r in ranked:
-            rank     = r["rank"]
-            is_fresh = r.get("is_fresher", False)
-            score    = r["final_score"]
-            sc       = score_color(score)
-            card_cls = "top3" if rank <= 3 else ("fresh" if is_fresh else "")
-            rlabel   = RANK_EMOJI.get(rank, f"#{rank}")
-
-            badges = ""
-            if rank <= 3:  badges += '<span class="r-badge b-top">⭐ Top 3</span>'
-            if is_fresh:   badges += '<span class="r-badge b-fresh">🌱 Fresher</span>'
-            if r.get("fresher_uplift", 1) > 1.0:
-                badges += f'<span class="r-badge b-boost">×{r["fresher_uplift"]:.2f}</span>'
-
-            name    = _html.escape(str(r.get("name") or r.get("candidate_id", "—")))
-            title   = _html.escape(str(r.get("title", "")))
-            company = _html.escape(str(r.get("company", "")))
-            yoe_v   = r.get("yoe", "")
-            meta    = "  ".join(filter(None, [title, f"@ {company}" if company else "", f"• {yoe_v} YoE" if yoe_v not in ("", None, "None") else ""]))
-
-            bars = ""
-            for lbl, key, col in [
-                ("Skill", "skill_score", "#f43f5e"),
-                ("Exp",   "experience_score", "#4ade80"),
-                ("Edu",   "education_score",  "#fbbf24"),
-                ("Certs", "certification_score", "#a78bfa"),
-            ]:
-                sv = r.get(key, 0) or 0
-                bars += (
-                    f'<div class="mbar">'
-                    f'<span class="mbar-label">{lbl}</span>'
-                    f'<div class="mbar-bg"><div class="mbar-fill" style="width:{sv*100:.0f}%;background:{col}"></div></div>'
-                    f'<span class="mbar-val">{sv:.2f}</span>'
-                    f'</div>'
-                )
-
-            st.markdown(f"""
-<div class="r-card {card_cls}" style="max-width:900px;margin:0 auto 12px;">
-  <div style="display:flex;gap:16px;align-items:flex-start;">
-    <div style="font-size:1.6rem;min-width:48px;text-align:center;padding-top:2px">{rlabel}</div>
-    <div style="flex:1;min-width:0;">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
-        <span class="r-name">{name}</span>{badges}
-      </div>
-      <div class="r-meta">{meta or "—"}</div>
-      <div style="margin-top:10px;">{bars}</div>
-    </div>
-    <div style="min-width:70px;">
-      <div class="r-score" style="color:{sc};">{score:.4f}</div>
-      <div class="r-score-sub">Score</div>
-    </div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
-
-            reasoning = r.get("reasoning", "")
-            if reasoning:
-                with st.expander(f"📋 Why #{rank}? — Full breakdown"):
-                    ca, cb = st.columns(2)
-                    with ca:
-                        st.markdown("**Signal scores**")
-                        for sl, sk, scol in [
-                            ("🎯 Skill",      "skill_score",         "#f43f5e"),
-                            ("📅 Experience", "experience_score",    "#4ade80"),
-                            ("🎓 Education",  "education_score",     "#fbbf24"),
-                            ("📋 Complete",   "completeness_score",  "#94a3b8"),
-                            ("📜 Certs",      "certification_score", "#a78bfa"),
-                            ("🔍 Keywords",   "keyword_score",       "#64748b"),
-                        ]:
-                            sv = r.get(sk, 0) or 0
-                            filled = int(sv * 20)
-                            bar = "█" * filled + "░" * (20 - filled)
-                            st.markdown(f'{sl}: <code style="color:{scol}">{bar}</code> `{sv:.3f}`', unsafe_allow_html=True)
-                        if r.get("fresher_uplift", 1) > 1.0:
-                            st.success(f"🚀 Fresher boost ×{r['fresher_uplift']:.3f}")
-                    with cb:
-                        st.markdown("**Reasoning**")
-                        for chunk in reasoning.split(" || "):
-                            if ":" in chunk:
-                                tag, _, detail = chunk.partition(": ")
-                                st.markdown(f"**{tag}**: {detail}")
-
-        # ── Download ──────────────────────────────────────────────────────────
-        rows = [{
-            "rank": r["rank"], "candidate_id": r.get("candidate_id", ""),
-            "name": r.get("name", ""), "title": r.get("title", ""),
-            "company": r.get("company", ""), "yoe": r.get("yoe", ""),
-            "is_fresher": r.get("is_fresher", False),
-            "final_score": round(r["final_score"], 6),
-            "skill_score": round(r.get("skill_score", 0), 4),
-            "experience_score": round(r.get("experience_score", 0), 4),
-            "education_score": round(r.get("education_score", 0), 4),
-            "certification_score": round(r.get("certification_score", 0), 4),
-            "fresher_uplift": round(r.get("fresher_uplift", 1), 4),
-            "reasoning": r.get("reasoning", ""),
-        } for r in ranked]
-
-        df_out = pd.DataFrame(rows)
-        st.markdown("<br/>", unsafe_allow_html=True)
+    st.markdown("**6 Scoring Signals:**")
+    signals_info = [
+        ("🎯", "Skill Match",     "35%", "JD skills found in candidate profile"),
+        ("📅", "Experience",      "25%", "YoE curve — freshers boosted"),
+        ("🎓", "Education",       "15%", "Institution tier + field + GPA"),
+        ("📋", "Completeness",    "10%", "Fields filled + GitHub / LinkedIn"),
+        ("📜", "Certifications",  "10%", "ML/AI upskilling evidence"),
+        ("🔍", "Keywords",         "5%", "Implicit JD mentions across full text"),
+    ]
+    for icon, name, weight, desc in signals_info:
         st.markdown(
-            f'<h3 style="font-family:Inter,sans-serif;font-weight:700;color:#f1f5f9;'
-            f'max-width:900px;margin:0 auto 16px;">💾 Download Results</h3>',
-            unsafe_allow_html=True
+            f'<div class="sig-row">'
+            f'<span class="sig-icon">{icon}</span>'
+            f'<span class="sig-name">{name}</span>'
+            f'<span class="sig-wt">{weight}</span>'
+            f'</div>'
+            f'<div style="color:#64748b;font-size:.74rem;padding:1px 0 4px 30px;">{desc}</div>',
+            unsafe_allow_html=True,
         )
-        dl1, dl2, _ = st.columns([1, 1, 4])
-        with dl1:
-            st.download_button(
-                "⬇️ CSV", df_out.to_csv(index=False).encode(),
-                "ranked_candidates.csv", "text/csv", use_container_width=True,
+
+    st.divider()
+    st.markdown("### 🌱 Fresher Boost")
+    st.markdown("""
+Candidates with **≤ 2 YoE** get up to **×1.30 bonus** for:
+- GitHub activity
+- Strong certifications
+- Top-tier institution
+- Good skill coverage
+""")
+    st.markdown("Dual-track guarantees **30 fresher slots** in the top 100.")
+
+    st.divider()
+    st.markdown("### 📂 Accepted Formats")
+    st.markdown("""
+- **CSV** — Google Forms export
+- **Excel** — .xlsx / .xls
+- **JSON** — array of objects
+- **JSONL** — challenge format
+""")
+    st.markdown("**Auto-detects** 50+ column name variants — no setup needed.")
+
+    st.divider()
+    st.markdown("### ⚡ Cache Status")
+    if "cache_stats" in st.session_state:
+        cs = st.session_state["cache_stats"]
+        hit  = cs.get("hit", False)
+        icon = "⚡ Cache Hit" if hit else "⚙️ Computed"
+        color = "#22c55e" if hit else "#f59e0b"
+        st.markdown(
+            f'<div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);'
+            f'border-radius:10px;padding:12px 14px;">>'
+            f'<div style="color:{color};font-weight:700;font-size:.9rem;">{icon}</div>'
+            f'<div style="color:#94a3b8;font-size:.78rem;margin-top:4px;">>'
+            f'Parse: {cs.get("parse_ms",0):.0f} ms<br>'
+            f'Rank: {cs.get("rank_ms",0):.0f} ms<br>'
+            f'Total: {cs.get("total_ms",0):.0f} ms'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Run a ranking to see cache stats.")
+
+    if st.button("🗑️ Clear Cache", use_container_width=True):
+        _cached_parse_bytes.clear()
+        _cached_parse_path.clear()
+        _cached_rank.clear()
+        if "cache_stats" in st.session_state:
+            del st.session_state["cache_stats"]
+        st.success("✅ Cache cleared.")
+
+
+# ── HEADER ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+  <h1>🎯 RedRob AI Candidate Ranker</h1>
+  <p>Upload candidate data in <strong>any format</strong> and get a ranked shortlist
+     with full, explainable reasoning — no APIs, no black boxes.</p>
+  <div class="pill-row">
+    <span class="pill">📂 CSV · Excel · JSON · JSONL</span>
+    <span class="pill">🧠 6-Signal Scoring</span>
+    <span class="pill">🌱 Fresher-Friendly</span>
+    <span class="pill">🔒 100% Offline</span>
+    <span class="pill">💾 Export CSV / JSON</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── INPUT ROW ──────────────────────────────────────────────────────────────────
+left_col, right_col = st.columns([1, 1], gap="large")
+
+# Session-state initialisation (runs once)
+if "local_path_val" not in st.session_state:
+    st.session_state["local_path_val"] = ""
+
+with left_col:
+    st.markdown("#### 📂 Candidate Data")
+
+    tab_upload, tab_path = st.tabs(["⬆️ Upload File (small files)", "📁 Load from Path (large files)"])
+
+    uploaded_file = None
+    local_path    = None          # will be set below from session_state or text_input
+
+    with tab_upload:
+        st.caption("Best for CSV / Excel / JSON under ~100 MB")
+        uploaded_file = st.file_uploader(
+            "Drop your file here",
+            type=["csv", "xlsx", "xls", "json", "jsonl"],
+            help="Google Forms CSV, spreadsheet, JSON array or JSONL",
+            label_visibility="collapsed",
+        )
+        if uploaded_file:
+            st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB")
+
+    with tab_path:
+        st.caption("Use this for large files (400 MB+) already on your computer")
+
+        DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
+
+        # ── Security: allowed extensions and base directories ──
+        ALLOWED_EXTS  = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
+        ALLOWED_BASES = [
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Documents"),
+            "/tmp",
+        ]
+
+        def _safe_path(p):
+            """Return (ok, reason) — True only if ext and base dir are whitelisted."""
+            p = os.path.realpath(p)          # resolve symlinks / traversal
+            ext = os.path.splitext(p)[1].lower()
+            if ext not in ALLOWED_EXTS:
+                return False, f"File type `{ext}` not allowed. Use: {', '.join(sorted(ALLOWED_EXTS))}"
+            if not any(p.startswith(b) for b in ALLOWED_BASES):
+                return False, f"Path must be inside Desktop, Downloads, or Documents."
+            return True, ""
+
+        # One-click quick-fill button — stores path in session_state
+        if os.path.isfile(DEFAULT_JSONL):
+            if st.button("📂 Use challenge dataset  (candidates.jsonl — 465 MB)",
+                         use_container_width=True):
+                st.session_state["local_path_val"] = DEFAULT_JSONL
+
+        # Text input — pre-filled from session_state so quick-fill works instantly
+        typed = st.text_input(
+            "Or paste any file path:",
+            value=st.session_state["local_path_val"],
+            placeholder=DEFAULT_JSONL,
+            key="path_text_input",
+        )
+        # Always sync typed value back to session_state
+        st.session_state["local_path_val"] = typed.strip()
+
+        # Validate and expose
+        _raw_path = st.session_state["local_path_val"]
+        if _raw_path:
+            ok, reason = _safe_path(_raw_path)
+            if not ok:
+                st.error(f"❌ {reason}")
+                local_path = None
+            elif os.path.isfile(os.path.realpath(_raw_path)):
+                size_mb = os.path.getsize(_raw_path) / 1024 / 1024
+                st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
+                local_path = os.path.realpath(_raw_path)   # canonical safe path
+            else:
+                st.error(f"❌ File not found:\n`{_raw_path}`")
+                local_path = None
+        else:
+            local_path = None
+
+
+with right_col:
+    st.markdown("#### 📝 Job Description")
+    DEFAULT_JD = """Software / AI Engineer (General Tech Hiring)
+
+We are hiring across engineering, data, AI, and product roles.
+
+Core Skills Required:
+- Python or Java or JavaScript or Go
+- REST APIs, Microservices, SQL
+- Cloud platforms: AWS or Azure or GCP
+- Agile / Scrum methodologies
+- Problem-solving and system design
+
+Preferred / Additional Skills:
+- Machine learning, NLP, or data science
+- DevOps: Docker, Kubernetes, CI/CD
+- Frontend: React, TypeScript
+- Data engineering: Spark, Kafka, Hadoop
+- Mobile: Android or iOS development
+
+Education: Any engineering or CS background
+Experience: 0–10 years (freshers welcome)
+Location: India preferred, open to remote"""
+
+    jd_text = st.text_area(
+        "Job Description",
+        value=DEFAULT_JD,
+        height=260,
+        label_visibility="collapsed",
+    )
+
+# ── RUN BUTTON ─────────────────────────────────────────────────────────────────
+st.markdown("")
+btn_col, _ = st.columns([1, 4])
+with btn_col:
+    run_btn = st.button("🚀 Rank Candidates", type="primary", use_container_width=True)
+
+
+# ── RESULTS ────────────────────────────────────────────────────────────────────
+has_file = (uploaded_file is not None) or bool(local_path)
+
+if run_btn and has_file and jd_text.strip():
+
+    _t_total_start = time.perf_counter()
+    _parse_ms = _rank_ms = 0
+    _from_cache = True          # assume cache hit; set False if we compute
+
+    with st.spinner("⚡ Loading from cache or computing…"):
+
+        if uploaded_file is not None:
+            # ── browser upload ──
+            raw   = uploaded_file.read()
+            fname = uploaded_file.name
+            _t0 = time.perf_counter()
+            try:
+                candidates = _cached_parse_bytes.__wrapped__(raw, fname)   # test cache
+            except AttributeError:
+                pass
+            _t0 = time.perf_counter()
+            candidates  = _cached_parse_bytes(raw, fname)
+            _parse_ms   = (time.perf_counter() - _t0) * 1000
+            _has_progress = False
+
+        else:
+            # ── local file path ──
+            fname  = os.path.basename(local_path)
+            stat   = os.stat(local_path)
+            _mtime = stat.st_mtime
+            _size  = stat.st_size
+
+            progress_bar  = st.progress(0, text="⚡ Checking cache / reading file…")
+            _has_progress = True
+
+            _t0        = time.perf_counter()
+            candidates = _cached_parse_path(local_path, _mtime, _size, fname)
+            _parse_ms  = (time.perf_counter() - _t0) * 1000
+
+            progress_bar.progress(70, text="🤖 Ranking candidates…")
+
+        if not candidates:
+            st.error("❌ Could not parse the file. Check the format and try again.")
+            st.stop()
+
+        # ── Serialise for rank cache key ──
+        cands_json = _serialise_candidates(candidates)
+
+        _t0          = time.perf_counter()
+        ranked, jd_skills = _cached_rank(cands_json, jd_text)
+        _rank_ms     = (time.perf_counter() - _t0) * 1000
+
+        _total_ms = (time.perf_counter() - _t_total_start) * 1000
+
+        # Detect cache hit: very fast (<50ms) almost certainly came from cache
+        _from_cache = (_parse_ms + _rank_ms) < 50
+
+        st.session_state["cache_stats"] = {
+            "hit":      _from_cache,
+            "parse_ms": _parse_ms,
+            "rank_ms":  _rank_ms,
+            "total_ms": _total_ms,
+        }
+
+        if _has_progress:
+            progress_bar.progress(100, text="✅ Done — ranked!")
+
+    # ── Cache hit badge ──
+    if _from_cache:
+        st.success("⚡ **Results served from cache** — instant! (no recompute)")
+    else:
+        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — result now cached for next run.")
+
+
+    # ── STATS ─────────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("## 📊 Ranking Complete")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Candidates", f"{len(ranked):,}")
+    m2.metric("Top Score",  f"{ranked[0]['final_score']:.3f}" if ranked else "—")
+    m3.metric("Avg Score",  f"{sum(r['final_score'] for r in ranked)/max(1,len(ranked)):.3f}")
+    m4.metric("Freshers 🌱", sum(1 for r in ranked if r["is_fresher"]))
+    m5.metric("JD Skills",  len(jd_skills))
+
+    # ── JD SKILLS CHIPS ───────────────────────────────────────────
+    with st.expander("🔍 Skills extracted from Job Description", expanded=False):
+        chip_html = "".join(
+            f'<span class="chip">{s}</span>' for s in jd_skills[:50]
+        )
+        st.markdown(chip_html, unsafe_allow_html=True)
+        st.caption(f"{len(jd_skills)} skills identified from the job description text.")
+
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+
+    # ── RANKED LIST ───────────────────────────────────────────────
+    st.markdown("## 🏆 Ranked Candidates")
+
+    RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    def score_bar_color(score):
+        if score >= 0.75: return "#22c55e"
+        if score >= 0.55: return "#6366f1"
+        if score >= 0.35: return "#f59e0b"
+        return "#ef4444"
+
+    def pct_str(score):
+        return f"{score*100:.0f}%"
+
+    for r in ranked:
+        rank = r["rank"]
+        is_fresh = r["is_fresher"]
+        is_top3  = rank <= 3
+
+        card_class = "gold" if is_top3 else ("green" if is_fresh else "")
+        rank_label = RANK_EMOJI.get(rank, f"#{rank}")
+
+        # badges
+        badges = ""
+        if is_top3:
+            badges += '<span class="cbadge b-top">⭐ Top 3</span>'
+        if is_fresh:
+            badges += '<span class="cbadge b-fresh">🌱 Fresher</span>'
+        if r["fresher_uplift"] > 1.0:
+            badges += f'<span class="cbadge b-boost">×{r["fresher_uplift"]:.2f} Boost</span>'
+
+        # meta line
+        # ── XSS protection: escape ALL user-supplied data before HTML rendering ──
+        name     = html_mod.escape(r.get("name") or r.get("candidate_id", "—"))
+        title    = html_mod.escape(r.get("title", ""))
+        company  = html_mod.escape(r.get("company", ""))
+        location = html_mod.escape(r.get("location", ""))
+        yoe_val  = r.get("yoe", "")
+
+        meta_parts = []
+        if title:   meta_parts.append(title)
+        if company: meta_parts.append(f"@ {company}")
+        if yoe_val is not None and yoe_val != "": meta_parts.append(f"• {yoe_val} YoE")
+        if location: meta_parts.append(f"• 📍 {location}")
+        meta_str = "  ".join(meta_parts)
+
+        # signal mini-bars (HTML)
+        bar_color = score_bar_color(r["final_score"])
+        signals_html = ""
+        for sig_name, sig_key, sig_color in [
+            ("Skill",  "skill_score",          "#6366f1"),
+            ("Exp",    "experience_score",      "#22c55e"),
+            ("Edu",    "education_score",       "#f59e0b"),
+            ("Certs",  "certification_score",   "#a78bfa"),
+        ]:
+            sv = r.get(sig_key, 0)
+            signals_html += (
+                f'<div class="pbar-row">'
+                f'<span class="pbar-label">{sig_name}</span>'
+                f'<div class="pbar-bg"><div class="pbar-fill" '
+                f'style="width:{pct_str(sv)};background:{sig_color};"></div></div>'
+                f'<span class="pbar-val">{pct_str(sv)}</span>'
+                f'</div>'
             )
-        with dl2:
-            st.download_button(
-                "⬇️ JSON", json.dumps(rows, indent=2, default=str).encode(),
-                "ranked_candidates.json", "application/json", use_container_width=True,
-            )
+
+        card_html = f"""
+<div class="ccard {card_class}">
+  <div style="display:flex;gap:16px;align-items:flex-start;">
+    <div style="min-width:48px;text-align:center;padding-top:2px;">
+      <div class="rank-num">{rank_label}</div>
+    </div>
+    <div style="flex:1;min-width:0;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+        <span class="cname">{name}</span>
+        {badges}
+      </div>
+      <div class="cmeta">{meta_str}</div>
+      {signals_html}
+    </div>
+    <div style="min-width:64px;text-align:right;">
+      <div class="score-big" style="color:{bar_color};">{r['final_score']:.4f}</div>
+      <div style="color:#64748b;font-size:.72rem;margin-top:2px;">Score</div>
+    </div>
+  </div>
+</div>
+"""
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        # Expandable breakdown
+        with st.expander(f"📋 Why #{rank}? — Full scoring breakdown"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**Signal Breakdown**")
+                sigs = [
+                    ("🎯 Skill Match",    r["skill_score"],          "#6366f1"),
+                    ("📅 Experience",     r["experience_score"],     "#22c55e"),
+                    ("🎓 Education",      r["education_score"],      "#f59e0b"),
+                    ("📋 Completeness",   r["completeness_score"],   "#94a3b8"),
+                    ("📜 Certifications", r["certification_score"],  "#a78bfa"),
+                    ("🔍 Keywords",       r["keyword_score"],        "#64748b"),
+                ]
+                for sig_label, sig_val, sig_col in sigs:
+                    filled = int(sig_val * 20)
+                    bar_s  = "█" * filled + "░" * (20 - filled)
+                    st.markdown(
+                        f'{sig_label}: <code style="color:{sig_col}">{bar_s}</code> '
+                        f'`{sig_val:.3f}`',
+                        unsafe_allow_html=True,
+                    )
+                if r["fresher_uplift"] > 1.0:
+                    st.success(f"🚀 Fresher Boost applied: ×{r['fresher_uplift']:.3f}")
+
+            with col_b:
+                st.markdown("**Reasoning**")
+                for chunk in r.get("reasoning", "").split(" || "):
+                    if ":" in chunk:
+                        tag, _, detail = chunk.partition(": ")
+                        st.markdown(f"**{tag}**: {detail}")
+
+    # ── DOWNLOAD ──────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("### 💾 Download Results")
+
+    rows = [{
+        "rank": r["rank"], "candidate_id": r["candidate_id"],
+        "name": r.get("name",""), "title": r.get("title",""),
+        "company": r.get("company",""), "location": r.get("location",""),
+        "yoe": r.get("yoe",""), "is_fresher": r["is_fresher"],
+        "final_score": r["final_score"],
+        "skill_score": r["skill_score"], "experience_score": r["experience_score"],
+        "education_score": r["education_score"], "completeness_score": r["completeness_score"],
+        "certification_score": r["certification_score"], "keyword_score": r["keyword_score"],
+        "fresher_uplift": r["fresher_uplift"],
+        "skill_match_detail": r["skill_match_detail"],
+        "experience_detail": r["experience_detail"],
+        "education_detail": r["education_detail"],
+        "certification_detail": r["certification_detail"],
+        "reasoning": r["reasoning"],
+    } for r in ranked]
+
+    df_exp = pd.DataFrame(rows)
+    dc1, dc2, _ = st.columns([1, 1, 2])
+    with dc1:
+        st.download_button("⬇️ Download CSV",
+            df_exp.to_csv(index=False).encode(),
+            "ranked_candidates.csv", "text/csv",
+            use_container_width=True)
+    with dc2:
+        st.download_button("⬇️ Download JSON",
+            json.dumps(rows, indent=2, default=str).encode(),
+            "ranked_candidates.json", "application/json",
+            use_container_width=True)
+
+    with st.expander("📊 View as Table"):
+        st.dataframe(df_exp[[
+            "rank","name","title","company","yoe","is_fresher",
+            "final_score","skill_score","experience_score","education_score",
+        ]].rename(columns={
+            "rank":"Rank","name":"Name","title":"Title","company":"Company",
+            "yoe":"YoE","is_fresher":"Fresher?","final_score":"Score",
+            "skill_score":"Skill","experience_score":"Exp","education_score":"Edu",
+        }), hide_index=True, use_container_width=True)
+
+elif run_btn and not has_file:
+    st.warning("⚠️ Please upload a file or paste a file path first.")
+elif run_btn and not jd_text.strip():
+    st.warning("⚠️ Please enter a job description before ranking.")
+else:
+    # ── GETTING STARTED ───────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("### 👋 Getting Started")
+    ga, gb = st.columns(2)
+    with ga:
+        st.markdown("**Sample Google Forms CSV columns:**")
+        st.dataframe(pd.DataFrame({
+            "Your Name":             ["Priya Sharma",  "Rahul Mehta"],
+            "Years of Experience":   ["0",             "5"],
+            "Technical Skills":      ["Python, PyTorch, NLP", "Python, FAISS, MLOps"],
+            "College / University":  ["IIT Bombay",    "NIT Trichy"],
+            "CGPA / Percentage":     ["9.2 CGPA",      "75%"],
+            "Certifications":        ["DeepLearning.AI", "AWS ML Specialty"],
+            "GitHub Profile":        ["github.com/ps", "github.com/rm"],
+        }), hide_index=True, use_container_width=True)
+
+    with gb:
+        st.markdown("**What you'll get per candidate:**")
+        st.markdown("""
+- 🏆 **Final rank** (1–N) with composite score
+- 🎯 **Skill match %** — which JD skills were found
+- 📅 **Experience score** — YoE curve with fresher boost
+- 🎓 **Education score** — institution tier + GPA
+- 📜 **Certification score** — ML upskilling signals
+- 📋 **Full reasoning** — every score explained in plain text
+- 💾 **Downloadable** CSV + JSON output
+""")
+        st.info("The system auto-detects column names — no manual mapping needed.", icon="✨")
