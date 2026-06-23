@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import json
 import io
+import os
 from universal_parser import parse_any_format
 from universal_scorer import rank_candidates, _extract_skills_from_jd
 
@@ -217,7 +218,6 @@ with left_col:
             label_visibility="collapsed",
         )
         if local_path:
-            import os
             if os.path.isfile(local_path):
                 size_mb = os.path.getsize(local_path) / 1024 / 1024
                 st.success(f"✅ Found: **{os.path.basename(local_path)}** — {size_mb:.1f} MB")
@@ -281,8 +281,6 @@ with btn_col:
 has_file = uploaded_file is not None or (local_path is not None)
 
 if run_btn and has_file and jd_text.strip():
-    import os
-
     with st.spinner("⚙️ Parsing file and scoring candidates…"):
 
         if uploaded_file is not None:
@@ -290,29 +288,29 @@ if run_btn and has_file and jd_text.strip():
             raw = uploaded_file.read()
             fname = uploaded_file.name
             candidates = parse_any_format(raw, fname)
+            _has_progress = False
 
         else:
             # ── local file path (large files, read from disk) ──
             fname = os.path.basename(local_path)
-            ext   = os.path.splitext(fname)[1].lower()
 
             progress_bar = st.progress(0, text="📚 Reading file from disk…")
-            file_size = os.path.getsize(local_path)
+            _has_progress = True
 
             with open(local_path, "rb") as fh:
                 raw = fh.read()
 
             progress_bar.progress(50, text="⚡ Parsing candidates…")
             candidates = parse_any_format(raw, fname)
-            progress_bar.progress(80, text="🤖 Scoring…")
+            progress_bar.progress(80, text="🤖 Scoring candidates…")
 
         if not candidates:
-            st.error("❌ Could not parse the file. Check format and try again.")
+            st.error("❌ Could not parse the file. Check the format and try again.")
             st.stop()
 
         ranked, jd_skills = rank_candidates(candidates, jd_text)
-        if 'progress_bar' in dir():
-            progress_bar.progress(100, text="✅ Done!")
+        if _has_progress:
+            progress_bar.progress(100, text="✅ Done — ranked!")
 
     st.balloons()
 
