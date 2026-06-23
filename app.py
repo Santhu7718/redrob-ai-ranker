@@ -15,46 +15,38 @@ from universal_parser import parse_any_format
 from universal_scorer import rank_candidates, _extract_skills_from_jd
 
 # ── MEMOISED WRAPPERS ──────────────────────────────────────────────────────────
-# st.cache_data persists across reruns for the same cache key.
-# parse: keyed on (file_bytes, filename) — Streamlit auto-hashes bytes.
-# rank:  keyed on a stable tuple from the parsed candidates + jd_text.
-# For LOCAL PATH files (400MB+), we avoid re-hashing the giant byte array
-# by using (realpath, mtime, size) as an O(1) cache key instead.
+# Two unified cached functions — each does parse + rank in one call.
+#
+# For UPLOADED files  → key = hash(raw_bytes) + jd_text
+#   Streamlit auto-hashes bytes, so this is content-aware.
+#
+# For LOCAL PATH files → key = (realpath, mtime, size, jd_text)  [O(1)]
+#   We stat() the file instead of hashing 400MB+ of bytes.
+#   Change the JD → cache miss → re-ranks (fast, keeps same parse).
+#   Change the file → cache miss (mtime/size changed) → re-reads.
 
 @st.cache_data(show_spinner=False, max_entries=3)
-def _cached_parse_bytes(raw: bytes, filename: str) -> list:
-    """Parse file bytes → list of candidate dicts. Cached by file content hash."""
-    return parse_any_format(raw, filename)
+def _cached_from_bytes(raw: bytes, filename: str, jd_text: str) -> tuple:
+    """Parse + rank an uploaded file. Cached by (file_bytes_hash, jd_text)."""
+    cands = parse_any_format(raw, filename)
+    if not cands:
+        return [], []
+    return rank_candidates(cands, jd_text)
 
 @st.cache_data(show_spinner=False, max_entries=3)
-def _cached_parse_path(realpath: str, _mtime: float, _size: int, filename: str) -> list:
+def _cached_from_path(realpath: str, _mtime: float, _size: int,
+                      filename: str, jd_text: str) -> tuple:
     """
-    Parse a large on-disk file WITHOUT loading its full bytes into the cache key.
-    Cache key = (realpath, mtime, size) — O(1) stat call instead of O(n) hash.
-    _mtime and _size are prefixed with _ so Streamlit skips hashing them (they
-    are already primitive types embedded in the key).
+    Read, parse + rank a disk file.
+    Cache key = (realpath, mtime, size, jd_text) — O(1) stat, no byte hashing.
+    Change JD → re-ranks only. Change file → full re-read.
     """
     with open(realpath, "rb") as fh:
         raw = fh.read()
-    return parse_any_format(raw, filename)
-
-@st.cache_data(show_spinner=False, max_entries=5)
-def _cached_rank(candidates_json: str, jd_text: str) -> tuple:
-    """
-    Rank candidates. Cache key = (serialised candidates, jd_text).
-    Candidates are serialised to a compact JSON string so the list-of-dicts
-    is hashable and change-aware.
-    """
-    import json as _json
-    cands = _json.loads(candidates_json)
+    cands = parse_any_format(raw, filename)
+    if not cands:
+        return [], []
     return rank_candidates(cands, jd_text)
-
-def _serialise_candidates(cands: list) -> str:
-    """Compact JSON for cache key — stable sort by candidate_id."""
-    return json.dumps(
-        sorted(cands, key=lambda c: c.get("candidate_id", "")),
-        sort_keys=True, separators=(',', ':')
-    )
 
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────────────────
@@ -65,621 +57,105 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── GLOBAL CSS — Complete Design System ───────────────────────────────────────
+# ── GLOBAL CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — DESIGN TOKENS
-═══════════════════════════════════════════════════════════════════ */
-:root {
-  /* Backgrounds */
-  --bg-base:      #080B14;
-  --bg-surface:   #0F1220;
-  --bg-elevated:  #161B2E;
-  --bg-glass:     rgba(15,18,32,0.75);
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
-  /* Brand */
-  --primary:      #6366F1;
-  --primary-dim:  rgba(99,102,241,0.15);
-  --primary-glow: rgba(99,102,241,0.40);
-  --secondary:    #A78BFA;
-  --secondary-dim:rgba(167,139,250,0.12);
+html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
 
-  /* Semantic */
-  --success:      #22C55E; --success-dim: rgba(34,197,94,0.14);
-  --warning:      #F59E0B; --warning-dim: rgba(245,158,11,0.14);
-  --error:        #EF4444; --error-dim:   rgba(239,68,68,0.14);
-  --gold:         #EAB308; --gold-dim:    rgba(234,179,8,0.10);
-
-  /* Text */
-  --text-1: #E2E8F0;
-  --text-2: #94A3B8;
-  --text-3: #475569;
-
-  /* Borders */
-  --border:       rgba(255,255,255,0.07);
-  --border-hover: rgba(99,102,241,0.45);
-
-  /* Radius */
-  --r-sm: 8px; --r-md: 14px; --r-lg: 20px; --r-xl: 28px;
-
-  /* Typography */
-  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — TYPOGRAPHY & BASE
-═══════════════════════════════════════════════════════════════════ */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
-
-html, body, [class*="css"], .stApp, .stMarkdown, p, span, div {
-  font-family: var(--font) !important;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — APP BACKGROUND (animated mesh gradient)
-═══════════════════════════════════════════════════════════════════ */
 .stApp {
-  background:
-    radial-gradient(ellipse 80% 50% at 20% -10%, rgba(99,102,241,0.12) 0%, transparent 60%),
-    radial-gradient(ellipse 60% 40% at 80% 110%, rgba(167,139,250,0.09) 0%, transparent 55%),
-    radial-gradient(ellipse 100% 80% at 50% 50%, #080B14 0%, #080B14 100%);
-  min-height: 100vh;
+    background: linear-gradient(135deg,#0d0f1a 0%,#111827 60%,#0d0f1a 100%);
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — SIDEBAR
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stSidebar"] {
-  background: linear-gradient(180deg, #0C0F1E 0%, #080B14 100%) !important;
-  border-right: 1px solid var(--border) !important;
-}
-[data-testid="stSidebar"] > div { padding: 0 !important; }
-[data-testid="stSidebarContent"] { padding: 20px 16px 24px !important; }
-
-/* Sidebar headings */
-[data-testid="stSidebar"] h2 {
-  font-size: 1.1rem !important; font-weight: 800 !important;
-  color: var(--text-1) !important; margin: 0 0 2px !important;
-  letter-spacing: -.01em;
-}
-[data-testid="stSidebar"] h3 {
-  font-size: .82rem !important; font-weight: 700 !important;
-  color: var(--secondary) !important;
-  text-transform: uppercase; letter-spacing: .08em;
-  margin: 18px 0 10px !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — HERO BANNER
-═══════════════════════════════════════════════════════════════════ */
+/* hero banner */
 .hero {
-  position: relative; overflow: hidden;
-  background: linear-gradient(135deg, rgba(99,102,241,.16) 0%, rgba(167,139,250,.08) 100%);
-  border: 1px solid rgba(99,102,241,.28);
-  border-radius: var(--r-xl);
-  padding: 40px 44px 32px;
-  margin-bottom: 28px;
-}
-.hero::before {
-  content: ''; position: absolute;
-  top: -60px; right: -60px;
-  width: 220px; height: 220px;
-  background: radial-gradient(circle, rgba(99,102,241,.18) 0%, transparent 70%);
-  pointer-events: none;
-}
-.hero::after {
-  content: ''; position: absolute;
-  bottom: -40px; left: 30%;
-  width: 160px; height: 160px;
-  background: radial-gradient(circle, rgba(167,139,250,.12) 0%, transparent 70%);
-  pointer-events: none;
+    background: linear-gradient(135deg,rgba(99,102,241,.18),rgba(167,139,250,.10));
+    border: 1px solid rgba(99,102,241,.25);
+    border-radius: 20px;
+    padding: 32px 36px 24px;
+    margin-bottom: 24px;
 }
 .hero h1 {
-  font-size: 2.5rem; font-weight: 900; letter-spacing: -.03em;
-  background: linear-gradient(135deg, #E0E7FF 0%, #A78BFA 50%, #6366F1 100%);
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  background-clip: text;
-  margin: 0 0 10px; line-height: 1.15;
+    font-size: 2.4rem; font-weight: 800;
+    background: linear-gradient(135deg,#e0e7ff,#a78bfa,#6366f1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; margin: 0 0 8px;
 }
-.hero p {
-  color: var(--text-2); font-size: 1rem; font-weight: 400;
-  line-height: 1.65; margin: 0 0 18px; max-width: 580px;
-}
+.hero p { color:#94a3b8; font-size:1rem; margin:0; }
 
-/* Feature pills row */
-.pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+/* metric pill */
+.pill-row { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
 .pill {
-  display: inline-flex; align-items: center; gap: 5px;
-  background: rgba(99,102,241,.10);
-  border: 1px solid rgba(99,102,241,.25);
-  border-radius: 30px;
-  padding: 5px 14px;
-  font-size: .78rem; font-weight: 600; color: var(--secondary);
-  letter-spacing: .01em;
-  transition: background .2s, border-color .2s;
-}
-.pill:hover { background: rgba(99,102,241,.18); border-color: rgba(99,102,241,.45); }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — SECTION LABEL
-═══════════════════════════════════════════════════════════════════ */
-.section-label {
-  font-size: .72rem; font-weight: 700; letter-spacing: .10em;
-  text-transform: uppercase; color: var(--text-3);
-  margin: 0 0 8px;
+    background:rgba(99,102,241,.12);
+    border:1px solid rgba(99,102,241,.25);
+    border-radius:30px;
+    padding:6px 16px;
+    font-size:.85rem; font-weight:600; color:#a78bfa;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — INPUT PANELS (glassmorphism)
-═══════════════════════════════════════════════════════════════════ */
-.input-panel {
-  background: rgba(15,18,32,0.6);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: 20px;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  transition: border-color .25s;
-}
-.input-panel:hover { border-color: rgba(99,102,241,.25); }
-
-/* Streamlit tab bar */
-[data-testid="stTabs"] [data-baseweb="tab-list"] {
-  background: rgba(255,255,255,.03) !important;
-  border-radius: var(--r-md) var(--r-md) 0 0 !important;
-  border-bottom: 1px solid var(--border) !important;
-  gap: 0 !important; padding: 0 4px !important;
-}
-[data-testid="stTabs"] [data-baseweb="tab"] {
-  background: transparent !important;
-  border: none !important; border-radius: 0 !important;
-  color: var(--text-2) !important;
-  font-size: .83rem !important; font-weight: 600 !important;
-  padding: 10px 16px !important;
-  transition: color .2s !important;
-}
-[data-testid="stTabs"] [data-baseweb="tab"]:hover { color: var(--text-1) !important; }
-[data-testid="stTabs"] [aria-selected="true"] {
-  color: var(--secondary) !important;
-  border-bottom: 2px solid var(--primary) !important;
-}
-[data-testid="stTabs"] [data-baseweb="tab-panel"] {
-  background: rgba(15,18,32,.45) !important;
-  border: 1px solid var(--border) !important;
-  border-top: none !important;
-  border-radius: 0 0 var(--r-md) var(--r-md) !important;
-  padding: 16px !important;
-}
-
-/* Streamlit text inputs */
-[data-testid="stTextInput"] > div > div > input,
-[data-testid="stTextArea"] > div > div > textarea {
-  background: rgba(8,11,20,.6) !important;
-  border: 1px solid rgba(255,255,255,.10) !important;
-  border-radius: var(--r-sm) !important;
-  color: var(--text-1) !important;
-  font-family: var(--font) !important;
-  font-size: .9rem !important;
-  transition: border-color .2s, box-shadow .2s !important;
-}
-[data-testid="stTextInput"] > div > div > input:focus,
-[data-testid="stTextArea"] > div > div > textarea:focus {
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 3px rgba(99,102,241,.20) !important;
-  outline: none !important;
-}
-
-/* File uploader */
-[data-testid="stFileUploader"] > div {
-  background: rgba(8,11,20,.5) !important;
-  border: 1.5px dashed rgba(99,102,241,.35) !important;
-  border-radius: var(--r-md) !important;
-  padding: 20px !important;
-  transition: border-color .2s, background .2s !important;
-}
-[data-testid="stFileUploader"] > div:hover {
-  border-color: rgba(99,102,241,.65) !important;
-  background: rgba(99,102,241,.06) !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 6 — PRIMARY BUTTON (CTA — Rank Candidates)
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stButton"] button[kind="primary"] {
-  background: linear-gradient(135deg, #6366F1 0%, #7C3AED 100%) !important;
-  border: none !important;
-  border-radius: var(--r-sm) !important;
-  color: #FFFFFF !important;
-  font-size: .95rem !important; font-weight: 700 !important;
-  letter-spacing: .01em;
-  padding: 14px 28px !important;
-  box-shadow: 0 4px 20px rgba(99,102,241,.35), 0 1px 0 rgba(255,255,255,.1) inset !important;
-  transition: all .2s ease !important;
-  position: relative; overflow: hidden;
-}
-[data-testid="stButton"] button[kind="primary"]::before {
-  content: ''; position: absolute; inset: 0;
-  background: linear-gradient(135deg, rgba(255,255,255,.08) 0%, transparent 60%);
-  pointer-events: none;
-}
-[data-testid="stButton"] button[kind="primary"]:hover {
-  transform: translateY(-2px) !important;
-  box-shadow: 0 8px 32px rgba(99,102,241,.50), 0 1px 0 rgba(255,255,255,.15) inset !important;
-}
-[data-testid="stButton"] button[kind="primary"]:active {
-  transform: translateY(0) !important;
-  box-shadow: 0 2px 8px rgba(99,102,241,.30) !important;
-}
-[data-testid="stButton"] button[kind="primary"]:focus-visible {
-  outline: 3px solid rgba(99,102,241,.6) !important;
-  outline-offset: 3px !important;
-}
-
-/* Secondary buttons */
-[data-testid="stButton"] button[kind="secondary"] {
-  background: rgba(255,255,255,.04) !important;
-  border: 1px solid rgba(255,255,255,.12) !important;
-  border-radius: var(--r-sm) !important;
-  color: var(--text-1) !important;
-  font-size: .86rem !important; font-weight: 600 !important;
-  transition: all .2s !important;
-}
-[data-testid="stButton"] button[kind="secondary"]:hover {
-  background: rgba(99,102,241,.10) !important;
-  border-color: rgba(99,102,241,.40) !important;
-  color: var(--secondary) !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — CANDIDATE RANK CARDS
-═══════════════════════════════════════════════════════════════════ */
+/* candidate card */
 .ccard {
-  position: relative; overflow: hidden;
-  background: rgba(15,18,32,.7);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 18px 22px 14px;
-  margin-bottom: 10px;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  transition: border-color .25s, background .25s, transform .2s, box-shadow .25s;
-  cursor: default;
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:14px;
+    padding:16px 20px 12px;
+    margin-bottom:10px;
+    transition:border-color .2s,background .2s;
 }
-.ccard::before {
-  content: ''; position: absolute;
-  left: 0; top: 0; bottom: 0; width: 3px;
-  background: var(--primary); border-radius: 3px 0 0 3px;
-  opacity: 0; transition: opacity .25s;
-}
-.ccard:hover {
-  border-color: var(--border-hover);
-  background: rgba(99,102,241,.06);
-  transform: translateX(3px);
-  box-shadow: 0 4px 24px rgba(0,0,0,.4), 0 0 0 1px rgba(99,102,241,.15);
-}
-.ccard:hover::before { opacity: 1; }
+.ccard:hover { border-color:rgba(99,102,241,.35); background:rgba(99,102,241,.05); }
+.ccard.gold   { border-color:rgba(234,179,8,.30); background:rgba(234,179,8,.04); }
+.ccard.green  { border-color:rgba(34,197,94,.28); background:rgba(34,197,94,.04); }
 
-/* Gold — top 3 */
-.ccard.gold {
-  border-color: rgba(234,179,8,.30);
-  background: rgba(234,179,8,.05);
-}
-.ccard.gold::before { background: var(--gold); }
-.ccard.gold:hover { border-color: rgba(234,179,8,.55); box-shadow: 0 4px 24px rgba(234,179,8,.12); }
-
-/* Green — freshers */
-.ccard.green {
-  border-color: rgba(34,197,94,.25);
-  background: rgba(34,197,94,.04);
-}
-.ccard.green::before { background: var(--success); }
-
-/* Rank badge */
-.rank-num {
-  font-size: 1.6rem; line-height: 1; font-weight: 900;
-  letter-spacing: -.04em;
-}
-
-/* Candidate name */
-.cname {
-  font-size: 1.05rem; font-weight: 700;
-  color: var(--text-1); letter-spacing: -.01em;
-}
-
-/* Meta line (title, company, YoE) */
-.cmeta {
-  font-size: .84rem; color: var(--text-2);
-  margin: 4px 0 10px; line-height: 1.5;
-}
-
-/* Badges */
+.rank-num { font-size:1.55rem; line-height:1; }
+.cname { font-size:1.05rem; font-weight:700; color:#e2e8f0; }
+.cmeta { font-size:.88rem; color:#94a3b8; margin:3px 0 8px; }
 .cbadge {
-  display: inline-flex; align-items: center;
-  padding: 2px 9px; border-radius: 20px;
-  font-size: .68rem; font-weight: 700; letter-spacing: .05em;
-  text-transform: uppercase; margin-right: 5px;
-  vertical-align: middle;
+    display:inline-block; padding:2px 9px; border-radius:20px;
+    font-size:.70rem; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; margin-right:5px;
 }
-.b-fresh { background: var(--success-dim); color: #4ADE80; border: 1px solid rgba(34,197,94,.30); }
-.b-top   { background: var(--gold-dim);    color: #FBBF24; border: 1px solid rgba(234,179,8,.30); }
-.b-boost { background: var(--primary-dim); color: var(--secondary); border: 1px solid rgba(99,102,241,.30); }
+.b-fresh { background:rgba(34,197,94,.15); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+.b-top   { background:rgba(234,179,8,.15);  color:#fbbf24; border:1px solid rgba(234,179,8,.3); }
+.b-boost { background:rgba(99,102,241,.15); color:#a78bfa; border:1px solid rgba(99,102,241,.3); }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — SIGNAL PROGRESS BARS (animated)
-═══════════════════════════════════════════════════════════════════ */
-.pbar-row {
-  display: flex; align-items: center; gap: 10px;
-  margin-bottom: 5px;
-}
-.pbar-label {
-  color: var(--text-3); font-size: .73rem; font-weight: 600;
-  min-width: 42px; text-transform: uppercase; letter-spacing: .04em;
-}
+/* progress bar row */
+.pbar-row { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+.pbar-label { color:#64748b; font-size:.75rem; min-width:72px; }
 .pbar-bg {
-  flex: 1; background: rgba(255,255,255,.06);
-  border-radius: 4px; height: 5px; overflow: hidden;
+    flex:1; background:rgba(255,255,255,.07);
+    border-radius:5px; height:6px; overflow:hidden;
 }
-.pbar-fill {
-  height: 5px; border-radius: 4px;
-  animation: barGrow .6s cubic-bezier(.22,1,.36,1) forwards;
-  transform-origin: left;
-}
-@keyframes barGrow {
-  from { transform: scaleX(0); opacity: .4; }
-  to   { transform: scaleX(1); opacity: 1; }
-}
-.pbar-val {
-  color: var(--text-2); font-size: .73rem; font-weight: 600;
-  min-width: 36px; text-align: right;
-}
-.score-big {
-  font-size: 1.15rem; font-weight: 900;
-  letter-spacing: -.03em; text-align: right;
-  font-variant-numeric: tabular-nums;
-}
+.pbar-fill { height:6px; border-radius:5px; }
+.pbar-val { color:#94a3b8; font-size:.75rem; min-width:34px; text-align:right; }
+.score-big { font-size:1.1rem; font-weight:800; text-align:right; }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — SKILL CHIPS
-═══════════════════════════════════════════════════════════════════ */
+/* skill chip */
 .chip {
-  display: inline-flex; align-items: center;
-  padding: 3px 10px; border-radius: 20px;
-  font-size: .74rem; font-weight: 500; margin: 2px 2px 2px 0;
-  background: var(--primary-dim); color: var(--secondary);
-  border: 1px solid rgba(99,102,241,.20);
-  transition: background .15s, border-color .15s;
+    display:inline-block; padding:3px 9px; border-radius:16px;
+    font-size:.76rem; font-weight:500; margin:2px;
+    background:rgba(99,102,241,.12); color:#a78bfa;
+    border:1px solid rgba(99,102,241,.22);
 }
-.chip:hover { background: rgba(99,102,241,.22); border-color: rgba(99,102,241,.40); }
-.chip.matched {
-  background: var(--success-dim); color: #4ADE80;
-  border-color: rgba(34,197,94,.28);
-}
+.chip.matched { background:rgba(34,197,94,.12); color:#4ade80; border-color:rgba(34,197,94,.28); }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — REASONING EXPANDER
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stExpander"] {
-  background: rgba(8,11,20,.5) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: var(--r-sm) !important;
-  margin-top: 10px !important;
-}
-[data-testid="stExpander"]:hover {
-  border-color: rgba(99,102,241,.30) !important;
-}
-[data-testid="stExpander"] summary {
-  color: var(--text-2) !important;
-  font-size: .82rem !important; font-weight: 600 !important;
-  padding: 10px 14px !important;
-}
-[data-testid="stExpander"] summary:hover { color: var(--secondary) !important; }
+/* section divider */
+.sdiv { border:none; border-top:1px solid rgba(255,255,255,.07); margin:18px 0; }
 
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — METRICS ROW
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="metric-container"] {
-  background: var(--bg-surface) !important;
-  border: 1px solid var(--border) !important;
-  border-radius: var(--r-md) !important;
-  padding: 16px !important;
-  transition: border-color .2s !important;
-}
-[data-testid="metric-container"]:hover {
-  border-color: rgba(99,102,241,.30) !important;
-}
-[data-testid="stMetricLabel"] { color: var(--text-3) !important; font-size: .76rem !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: .07em; }
-[data-testid="stMetricValue"] { color: var(--text-1) !important; font-size: 1.6rem !important; font-weight: 800 !important; letter-spacing: -.03em; }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — DOWNLOAD BUTTONS
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stDownloadButton"] button {
-  background: rgba(255,255,255,.04) !important;
-  border: 1px solid rgba(255,255,255,.12) !important;
-  border-radius: var(--r-sm) !important;
-  color: var(--text-1) !important;
-  font-weight: 600 !important; font-size: .86rem !important;
-  transition: all .2s !important;
-}
-[data-testid="stDownloadButton"] button:hover {
-  background: var(--success-dim) !important;
-  border-color: rgba(34,197,94,.40) !important;
-  color: #4ADE80 !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — ALERT / INFO / SUCCESS / WARNING BOXES
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stAlert"] {
-  border-radius: var(--r-sm) !important;
-  border-left-width: 3px !important;
-  font-size: .88rem !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — SECTION DIVIDER
-═══════════════════════════════════════════════════════════════════ */
-.sdiv {
-  border: none; border-top: 1px solid var(--border);
-  margin: 22px 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — SIDEBAR SCORING SIGNALS
-═══════════════════════════════════════════════════════════════════ */
+/* sidebar signal table */
 .sig-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.04);
+    display:flex; align-items:center; gap:8px;
+    padding:5px 0; border-bottom:1px solid rgba(255,255,255,.05);
 }
-.sig-icon { font-size: .95rem; min-width: 20px; }
-.sig-name {
-  color: var(--text-1); font-size: .80rem; font-weight: 600;
-  flex: 1; letter-spacing: -.01em;
-}
+.sig-icon { font-size:1rem; min-width:22px; }
+.sig-name { color:#e2e8f0; font-size:.82rem; font-weight:600; flex:1; }
 .sig-wt {
-  background: var(--primary-dim); color: var(--secondary);
-  border-radius: 10px; padding: 1px 8px;
-  font-size: .74rem; font-weight: 700; letter-spacing: .02em;
+    background:rgba(99,102,241,.18); color:#a78bfa;
+    border-radius:10px; padding:1px 8px; font-size:.78rem; font-weight:700;
 }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — SCROLLBAR
-═══════════════════════════════════════════════════════════════════ */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb {
-  background: rgba(99,102,241,.30); border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,.55); }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — STREAMLIT CHROME CLEANUP
-═══════════════════════════════════════════════════════════════════ */
-#MainMenu, footer, header { visibility: hidden; }
-[data-testid="stToolbar"] { display: none; }
-.block-container {
-  padding: 28px 32px 48px !important;
-  max-width: 1280px !important;
-}
-
-/* Streamlit select/radio */
-[data-testid="stRadio"] label, [data-testid="stSelectbox"] label {
-  color: var(--text-2) !important; font-size: .84rem !important; font-weight: 500 !important;
-}
-[data-testid="stSelectbox"] > div > div {
-  background: rgba(8,11,20,.6) !important;
-  border-color: rgba(255,255,255,.10) !important;
-  border-radius: var(--r-sm) !important;
-  color: var(--text-1) !important;
-}
-[data-testid="stDataFrame"] {
-  border-radius: var(--r-md) !important;
-  overflow: hidden !important;
-  border: 1px solid var(--border) !important;
-}
-
-/* Caption / help text */
-[data-testid="stCaptionContainer"] p {
-  color: var(--text-3) !important; font-size: .78rem !important;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 3 — FOCUS (WCAG 2.2 AA)
-═══════════════════════════════════════════════════════════════════ */
-*:focus-visible {
-  outline: 2px solid rgba(99,102,241,.7) !important;
-  outline-offset: 3px !important;
-  border-radius: 4px;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 6 — MICRO-ANIMATIONS
-═══════════════════════════════════════════════════════════════════ */
-@keyframes fadeUp {
-  from { opacity: 0; transform: translateY(12px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-@keyframes pulse-ring {
-  0%   { box-shadow: 0 0 0 0   rgba(99,102,241,.35); }
-  70%  { box-shadow: 0 0 0 10px rgba(99,102,241,.00); }
-  100% { box-shadow: 0 0 0 0   rgba(99,102,241,.00); }
-}
-.ccard { animation: fadeUp .35s ease both; }
-.ccard:nth-child(2) { animation-delay: .05s; }
-.ccard:nth-child(3) { animation-delay: .10s; }
-.ccard:nth-child(4) { animation-delay: .15s; }
-.ccard:nth-child(5) { animation-delay: .20s; }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 5 — FORM FIELD LABELS (Streamlit)
-═══════════════════════════════════════════════════════════════════ */
-[data-testid="stTextInput"] label, [data-testid="stTextArea"] label,
-[data-testid="stFileUploader"] label {
-  color: var(--text-2) !important;
-  font-size: .80rem !important; font-weight: 600 !important;
-  letter-spacing: .01em; text-transform: uppercase;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 8 — RESPONSIVE (Mobile-first)
-═══════════════════════════════════════════════════════════════════ */
-@media (max-width: 768px) {
-  .hero { padding: 24px 20px 20px; }
-  .hero h1 { font-size: 1.65rem; }
-  .hero p { font-size: .88rem; }
-  .block-container { padding: 16px 12px 32px !important; }
-  .ccard { padding: 14px 14px 10px; }
-  .rank-num { font-size: 1.25rem; }
-  .score-big { font-size: .95rem; }
-}
-@media (max-width: 480px) {
-  .hero h1 { font-size: 1.35rem; }
-  .pill { font-size: .70rem; padding: 4px 10px; }
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — RESULTS SECTION HEADER
-═══════════════════════════════════════════════════════════════════ */
-.results-header {
-  display: flex; align-items: center; gap: 12px;
-  margin: 24px 0 16px;
-}
-.results-header h2 {
-  font-size: 1.35rem; font-weight: 800;
-  color: var(--text-1); letter-spacing: -.02em; margin: 0;
-}
-.results-badge {
-  background: var(--primary-dim);
-  border: 1px solid rgba(99,102,241,.28);
-  border-radius: 20px; padding: 3px 12px;
-  font-size: .75rem; font-weight: 700;
-  color: var(--secondary); letter-spacing: .03em;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — GETTING STARTED (empty state)
-═══════════════════════════════════════════════════════════════════ */
-.empty-state {
-  text-align: center; padding: 48px 24px;
-  border: 1.5px dashed rgba(255,255,255,.08);
-  border-radius: var(--r-lg);
-  margin-top: 16px;
-}
-.empty-state .es-icon { font-size: 2.5rem; margin-bottom: 12px; }
-.empty-state h3 { font-size: 1.1rem; font-weight: 700; color: var(--text-1); margin: 0 0 8px; }
-.empty-state p { color: var(--text-2); font-size: .88rem; line-height: 1.65; max-width: 420px; margin: 0 auto; }
-
-/* ═══════════════════════════════════════════════════════════════════
-   PHASE 4 — CACHE BANNER (hit/miss)
-═══════════════════════════════════════════════════════════════════ */
-.cache-hit  { border-left: 3px solid var(--success) !important; }
-.cache-miss { border-left: 3px solid var(--warning) !important; }
+.sig-desc { color:#64748b; font-size:.76rem; margin-top:1px; }
 </style>
 """, unsafe_allow_html=True)
-
 
 
 # ── SIDEBAR ────────────────────────────────────────────────────────────────────
@@ -810,23 +286,22 @@ with left_col:
 
         DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
 
-        # ── Security: allowed extensions and base directories ──
-        ALLOWED_EXTS  = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
-        ALLOWED_BASES = [
-            os.path.expanduser("~/Desktop"),
-            os.path.expanduser("~/Downloads"),
-            os.path.expanduser("~/Documents"),
-            "/tmp",
-        ]
+        # ── Only check extension — this is a local single-user app ──
+        ALLOWED_EXTS = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
 
-        def _safe_path(p):
-            """Return (ok, reason) — True only if ext and base dir are whitelisted."""
-            p = os.path.realpath(p)          # resolve symlinks / traversal
+        def _safe_path(p: str):
+            """Return (ok, reason). Validates extension and that file exists."""
+            p = p.strip()
+            if not p:
+                return False, "No path entered."
             ext = os.path.splitext(p)[1].lower()
             if ext not in ALLOWED_EXTS:
-                return False, f"File type `{ext}` not allowed. Use: {', '.join(sorted(ALLOWED_EXTS))}"
-            if not any(p.startswith(b) for b in ALLOWED_BASES):
-                return False, f"Path must be inside Desktop, Downloads, or Documents."
+                return False, (
+                    f"File type `{ext or 'unknown'}` not supported. "
+                    f"Allowed: {', '.join(sorted(ALLOWED_EXTS))}"
+                )
+            if not os.path.isfile(p):
+                return False, f"File not found: `{p}`"
             return True, ""
 
         # One-click quick-fill button — stores path in session_state
@@ -852,13 +327,10 @@ with left_col:
             if not ok:
                 st.error(f"❌ {reason}")
                 local_path = None
-            elif os.path.isfile(os.path.realpath(_raw_path)):
+            else:
                 size_mb = os.path.getsize(_raw_path) / 1024 / 1024
                 st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
-                local_path = os.path.realpath(_raw_path)   # canonical safe path
-            else:
-                st.error(f"❌ File not found:\n`{_raw_path}`")
-                local_path = None
+                local_path = _raw_path
         else:
             local_path = None
 
@@ -906,73 +378,58 @@ has_file = (uploaded_file is not None) or bool(local_path)
 
 if run_btn and has_file and jd_text.strip():
 
-    _t_total_start = time.perf_counter()
-    _parse_ms = _rank_ms = 0
-    _from_cache = True          # assume cache hit; set False if we compute
+    _t_start = time.perf_counter()
 
     with st.spinner("⚡ Loading from cache or computing…"):
 
         if uploaded_file is not None:
-            # ── browser upload ──
+            # ── Browser upload ──
             raw   = uploaded_file.read()
             fname = uploaded_file.name
+
+            progress_bar  = st.progress(0, text="⚡ Parsing + ranking…")
+            _has_progress = True
+
             _t0 = time.perf_counter()
-            try:
-                candidates = _cached_parse_bytes.__wrapped__(raw, fname)   # test cache
-            except AttributeError:
-                pass
-            _t0 = time.perf_counter()
-            candidates  = _cached_parse_bytes(raw, fname)
-            _parse_ms   = (time.perf_counter() - _t0) * 1000
-            _has_progress = False
+            ranked, jd_skills = _cached_from_bytes(raw, fname, jd_text)
+            _op_ms = (time.perf_counter() - _t0) * 1000
+
+            progress_bar.progress(100, text="✅ Done!")
 
         else:
-            # ── local file path ──
+            # ── Local file path ──
             fname  = os.path.basename(local_path)
             stat   = os.stat(local_path)
-            _mtime = stat.st_mtime
-            _size  = stat.st_size
 
             progress_bar  = st.progress(0, text="⚡ Checking cache / reading file…")
             _has_progress = True
 
-            _t0        = time.perf_counter()
-            candidates = _cached_parse_path(local_path, _mtime, _size, fname)
-            _parse_ms  = (time.perf_counter() - _t0) * 1000
+            _t0 = time.perf_counter()
+            ranked, jd_skills = _cached_from_path(
+                local_path, stat.st_mtime, stat.st_size, fname, jd_text
+            )
+            _op_ms = (time.perf_counter() - _t0) * 1000
 
-            progress_bar.progress(70, text="🤖 Ranking candidates…")
-
-        if not candidates:
-            st.error("❌ Could not parse the file. Check the format and try again.")
-            st.stop()
-
-        # ── Serialise for rank cache key ──
-        cands_json = _serialise_candidates(candidates)
-
-        _t0          = time.perf_counter()
-        ranked, jd_skills = _cached_rank(cands_json, jd_text)
-        _rank_ms     = (time.perf_counter() - _t0) * 1000
-
-        _total_ms = (time.perf_counter() - _t_total_start) * 1000
-
-        # Detect cache hit: very fast (<50ms) almost certainly came from cache
-        _from_cache = (_parse_ms + _rank_ms) < 50
-
-        st.session_state["cache_stats"] = {
-            "hit":      _from_cache,
-            "parse_ms": _parse_ms,
-            "rank_ms":  _rank_ms,
-            "total_ms": _total_ms,
-        }
-
-        if _has_progress:
             progress_bar.progress(100, text="✅ Done — ranked!")
 
-    # ── Cache hit badge ──
+    if not ranked:
+        st.error("❌ Could not parse the file or no candidates found. Check the format.")
+        st.stop()
+
+    _total_ms   = (time.perf_counter() - _t_start) * 1000
+    _from_cache = _op_ms < 80     # <80ms almost certainly a cache hit
+
+    st.session_state["cache_stats"] = {
+        "hit":      _from_cache,
+        "parse_ms": 0,
+        "rank_ms":  _op_ms,
+        "total_ms": _total_ms,
+    }
+
     if _from_cache:
-        st.success("⚡ **Results served from cache** — instant! (no recompute)")
+        st.success(f"⚡ **From cache** — instant result in {_total_ms:.0f} ms!")
     else:
-        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — result now cached for next run.")
+        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — cached for next run.")
 
 
     # ── STATS ─────────────────────────────────────────────────────
