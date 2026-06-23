@@ -1,33 +1,20 @@
 """
 app.py — RedRob AI Candidate Ranker
-Streamlit UI — fixed rendering, clean layout, no raw HTML leaks.
+Premium UI · Fixed path loader · Full memoisation
 """
 
 import streamlit as st
 import pandas as pd
 import json
-import io
 import os
 import html as html_mod
 import time
-import hashlib
 from universal_parser import parse_any_format
 from universal_scorer import rank_candidates, _extract_skills_from_jd
 
-# ── MEMOISED WRAPPERS ──────────────────────────────────────────────────────────
-# Two unified cached functions — each does parse + rank in one call.
-#
-# For UPLOADED files  → key = hash(raw_bytes) + jd_text
-#   Streamlit auto-hashes bytes, so this is content-aware.
-#
-# For LOCAL PATH files → key = (realpath, mtime, size, jd_text)  [O(1)]
-#   We stat() the file instead of hashing 400MB+ of bytes.
-#   Change the JD → cache miss → re-ranks (fast, keeps same parse).
-#   Change the file → cache miss (mtime/size changed) → re-reads.
-
+# ── CACHED FUNCTIONS ────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, max_entries=3)
 def _cached_from_bytes(raw: bytes, filename: str, jd_text: str) -> tuple:
-    """Parse + rank an uploaded file. Cached by (file_bytes_hash, jd_text)."""
     cands = parse_any_format(raw, filename)
     if not cands:
         return [], []
@@ -36,11 +23,6 @@ def _cached_from_bytes(raw: bytes, filename: str, jd_text: str) -> tuple:
 @st.cache_data(show_spinner=False, max_entries=3)
 def _cached_from_path(realpath: str, _mtime: float, _size: int,
                       filename: str, jd_text: str) -> tuple:
-    """
-    Read, parse + rank a disk file.
-    Cache key = (realpath, mtime, size, jd_text) — O(1) stat, no byte hashing.
-    Change JD → re-ranks only. Change file → full re-read.
-    """
     with open(realpath, "rb") as fh:
         raw = fh.read()
     cands = parse_any_format(raw, filename)
@@ -48,565 +30,813 @@ def _cached_from_path(realpath: str, _mtime: float, _size: int,
         return [], []
     return rank_candidates(cands, jd_text)
 
-
-# ── PAGE CONFIG ────────────────────────────────────────────────────────────────
+# ── PAGE CONFIG ─────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="RedRob AI Candidate Ranker",
+    page_title="RedRob AI — Candidate Ranker",
     page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── GLOBAL CSS ─────────────────────────────────────────────────────────────────
+# ── PREMIUM CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 
-html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+*, html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif !important;
+}
 
+/* ── Base ── */
 .stApp {
-    background: linear-gradient(135deg,#0d0f1a 0%,#111827 60%,#0d0f1a 100%);
+    background: #060714;
+    background-image:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(99,102,241,0.15) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 40% at 80% 100%, rgba(168,85,247,0.12) 0%, transparent 50%),
+        radial-gradient(ellipse 40% 30% at 50% 50%, rgba(6,182,212,0.06) 0%, transparent 60%);
+    min-height: 100vh;
 }
 
-/* hero banner */
-.hero {
-    background: linear-gradient(135deg,rgba(99,102,241,.18),rgba(167,139,250,.10));
-    border: 1px solid rgba(99,102,241,.25);
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,.03); }
+::-webkit-scrollbar-thumb { background: rgba(99,102,241,.4); border-radius: 3px; }
+
+/* ── Hero Banner ── */
+.hero-wrap {
+    background: linear-gradient(135deg,
+        rgba(99,102,241,0.18) 0%,
+        rgba(168,85,247,0.12) 40%,
+        rgba(6,182,212,0.10) 100%);
+    border: 1px solid rgba(99,102,241,0.3);
+    border-radius: 24px;
+    padding: 40px 44px 32px;
+    margin-bottom: 28px;
+    position: relative;
+    overflow: hidden;
+}
+.hero-wrap::before {
+    content: '';
+    position: absolute;
+    top: -60px; right: -60px;
+    width: 260px; height: 260px;
+    background: radial-gradient(circle, rgba(168,85,247,0.15), transparent 70%);
+    border-radius: 50%;
+    pointer-events: none;
+}
+.hero-wrap::after {
+    content: '';
+    position: absolute;
+    bottom: -40px; left: -40px;
+    width: 200px; height: 200px;
+    background: radial-gradient(circle, rgba(6,182,212,0.10), transparent 70%);
+    border-radius: 50%;
+    pointer-events: none;
+}
+.hero-tag {
+    display: inline-block;
+    background: linear-gradient(135deg, rgba(99,102,241,.25), rgba(168,85,247,.20));
+    border: 1px solid rgba(99,102,241,.4);
     border-radius: 20px;
-    padding: 32px 36px 24px;
-    margin-bottom: 24px;
+    padding: 4px 14px;
+    font-size: .72rem;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: #a78bfa;
+    margin-bottom: 14px;
 }
-.hero h1 {
-    font-size: 2.4rem; font-weight: 800;
-    background: linear-gradient(135deg,#e0e7ff,#a78bfa,#6366f1);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text; margin: 0 0 8px;
+.hero-title {
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 2.8rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #ffffff 0%, #c4b5fd 45%, #67e8f9 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin: 0 0 10px;
+    line-height: 1.1;
 }
-.hero p { color:#94a3b8; font-size:1rem; margin:0; }
-
-/* metric pill */
-.pill-row { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+.hero-sub { color: #94a3b8; font-size: 1.02rem; margin: 0 0 20px; line-height: 1.6; }
+.pill-row { display: flex; gap: 10px; flex-wrap: wrap; }
 .pill {
-    background:rgba(99,102,241,.12);
-    border:1px solid rgba(99,102,241,.25);
-    border-radius:30px;
-    padding:6px 16px;
-    font-size:.85rem; font-weight:600; color:#a78bfa;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.10);
+    border-radius: 30px;
+    padding: 5px 14px;
+    font-size: .78rem;
+    font-weight: 600;
+    color: #cbd5e1;
+}
+.pill.indigo { border-color: rgba(99,102,241,.4); color: #a78bfa; background: rgba(99,102,241,.08); }
+.pill.cyan   { border-color: rgba(6,182,212,.4);  color: #67e8f9; background: rgba(6,182,212,.08); }
+.pill.purple { border-color: rgba(168,85,247,.4); color: #d946ef; background: rgba(168,85,247,.08); }
+.pill.green  { border-color: rgba(34,197,94,.4);  color: #4ade80; background: rgba(34,197,94,.08); }
+
+/* ── Section header ── */
+.sec-hdr {
+    font-size: .7rem; font-weight: 700; letter-spacing: .12em;
+    text-transform: uppercase; color: #6366f1; margin-bottom: 10px;
 }
 
-/* candidate card */
+/* ── Input panels ── */
+.input-panel {
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.08);
+    border-radius: 18px;
+    padding: 20px 20px 16px;
+    height: 100%;
+}
+.input-panel:hover { border-color: rgba(99,102,241,.25); }
+
+/* ── Streamlit widget overrides ── */
+.stTextInput > div > div > input,
+.stTextArea > div > div > textarea {
+    background: rgba(255,255,255,.04) !important;
+    border: 1px solid rgba(255,255,255,.12) !important;
+    border-radius: 10px !important;
+    color: #e2e8f0 !important;
+    font-size: .9rem !important;
+    padding: 10px 14px !important;
+    transition: border-color .2s !important;
+}
+.stTextInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+    border-color: rgba(99,102,241,.6) !important;
+    box-shadow: 0 0 0 3px rgba(99,102,241,.15) !important;
+}
+.stFileUploader {
+    background: rgba(255,255,255,.02) !important;
+    border: 1.5px dashed rgba(99,102,241,.35) !important;
+    border-radius: 12px !important;
+    padding: 10px !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    background: rgba(255,255,255,.03) !important;
+    border-radius: 10px !important;
+    padding: 4px !important;
+    gap: 4px !important;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px !important;
+    color: #94a3b8 !important;
+    font-weight: 600 !important;
+    font-size: .82rem !important;
+}
+.stTabs [aria-selected="true"] {
+    background: rgba(99,102,241,.25) !important;
+    color: #a78bfa !important;
+}
+div[data-testid="stButton"] button[kind="primary"] {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    border: none !important;
+    border-radius: 12px !important;
+    font-weight: 700 !important;
+    font-size: 1rem !important;
+    padding: 12px 28px !important;
+    box-shadow: 0 4px 20px rgba(99,102,241,.35) !important;
+    transition: all .2s !important;
+    letter-spacing: .02em !important;
+}
+div[data-testid="stButton"] button[kind="primary"]:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 8px 30px rgba(99,102,241,.5) !important;
+}
+div[data-testid="stButton"] button[kind="secondary"] {
+    background: rgba(99,102,241,.12) !important;
+    border: 1px solid rgba(99,102,241,.35) !important;
+    border-radius: 10px !important;
+    color: #a78bfa !important;
+    font-weight: 600 !important;
+    transition: all .2s !important;
+}
+div[data-testid="stButton"] button[kind="secondary"]:hover {
+    background: rgba(99,102,241,.22) !important;
+    border-color: rgba(99,102,241,.6) !important;
+}
+
+/* ── Metric cards ── */
+.metric-grid { display: flex; gap: 14px; flex-wrap: wrap; margin: 20px 0; }
+.metric-card {
+    flex: 1; min-width: 120px;
+    border-radius: 16px;
+    padding: 18px 18px 14px;
+    position: relative;
+    overflow: hidden;
+}
+.metric-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 16px;
+    padding: 1px;
+    background: linear-gradient(135deg, var(--c1), var(--c2));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+}
+.mc-indigo  { background: rgba(99,102,241,.08);  --c1: rgba(99,102,241,.6);  --c2: rgba(168,85,247,.3); }
+.mc-cyan    { background: rgba(6,182,212,.08);   --c1: rgba(6,182,212,.6);   --c2: rgba(99,102,241,.3); }
+.mc-purple  { background: rgba(168,85,247,.08);  --c1: rgba(168,85,247,.6);  --c2: rgba(236,72,153,.3); }
+.mc-green   { background: rgba(34,197,94,.08);   --c1: rgba(34,197,94,.6);   --c2: rgba(6,182,212,.3); }
+.mc-amber   { background: rgba(245,158,11,.08);  --c1: rgba(245,158,11,.6);  --c2: rgba(234,179,8,.3); }
+.metric-label { font-size:.7rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; opacity:.6; margin-bottom:6px; }
+.metric-value { font-family:'Space Grotesk',sans-serif !important; font-size:2rem; font-weight:800; line-height:1; }
+.metric-sub   { font-size:.72rem; opacity:.55; margin-top:4px; }
+
+/* ── Candidate cards ── */
 .ccard {
-    background:rgba(255,255,255,.03);
-    border:1px solid rgba(255,255,255,.08);
-    border-radius:14px;
-    padding:16px 20px 12px;
-    margin-bottom:10px;
-    transition:border-color .2s,background .2s;
+    background: rgba(255,255,255,.025);
+    border: 1px solid rgba(255,255,255,.07);
+    border-radius: 16px;
+    padding: 18px 22px 14px;
+    margin-bottom: 10px;
+    transition: border-color .25s, background .25s, transform .2s;
+    cursor: default;
 }
-.ccard:hover { border-color:rgba(99,102,241,.35); background:rgba(99,102,241,.05); }
-.ccard.gold   { border-color:rgba(234,179,8,.30); background:rgba(234,179,8,.04); }
-.ccard.green  { border-color:rgba(34,197,94,.28); background:rgba(34,197,94,.04); }
-
-.rank-num { font-size:1.55rem; line-height:1; }
+.ccard:hover {
+    border-color: rgba(99,102,241,.4);
+    background: rgba(99,102,241,.05);
+    transform: translateX(4px);
+}
+.ccard.gold {
+    background: rgba(245,158,11,.04);
+    border-color: rgba(245,158,11,.30);
+    box-shadow: 0 0 24px rgba(245,158,11,.06);
+}
+.ccard.silver {
+    background: rgba(148,163,184,.03);
+    border-color: rgba(148,163,184,.22);
+}
+.ccard.bronze {
+    background: rgba(180,120,70,.04);
+    border-color: rgba(180,120,70,.25);
+}
+.ccard.top {
+    background: rgba(99,102,241,.05);
+    border-color: rgba(99,102,241,.28);
+}
+.rank-badge {
+    min-width: 52px;
+    text-align: center;
+}
+.rank-num { font-family:'Space Grotesk',sans-serif !important; font-size:1.6rem; font-weight:800; line-height:1; }
 .cname { font-size:1.05rem; font-weight:700; color:#e2e8f0; }
-.cmeta { font-size:.88rem; color:#94a3b8; margin:3px 0 8px; }
+.cmeta { font-size:.84rem; color:#64748b; margin:3px 0 10px; }
 .cbadge {
     display:inline-block; padding:2px 9px; border-radius:20px;
-    font-size:.70rem; font-weight:700; letter-spacing:.04em;
-    text-transform:uppercase; margin-right:5px;
+    font-size:.67rem; font-weight:700; letter-spacing:.05em;
+    text-transform:uppercase; margin-right:4px;
 }
-.b-fresh { background:rgba(34,197,94,.15); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
-.b-top   { background:rgba(234,179,8,.15);  color:#fbbf24; border:1px solid rgba(234,179,8,.3); }
-.b-boost { background:rgba(99,102,241,.15); color:#a78bfa; border:1px solid rgba(99,102,241,.3); }
+.b-fresh  { background:rgba(34,197,94,.12); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+.b-top    { background:rgba(245,158,11,.12); color:#fbbf24; border:1px solid rgba(245,158,11,.3); }
+.b-boost  { background:rgba(168,85,247,.12); color:#d946ef; border:1px solid rgba(168,85,247,.3); }
+.b-cached { background:rgba(6,182,212,.12);  color:#67e8f9; border:1px solid rgba(6,182,212,.3); }
 
-/* progress bar row */
-.pbar-row { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
-.pbar-label { color:#64748b; font-size:.75rem; min-width:72px; }
-.pbar-bg {
-    flex:1; background:rgba(255,255,255,.07);
-    border-radius:5px; height:6px; overflow:hidden;
+/* ── Score big ── */
+.score-wrap { text-align:right; min-width:70px; }
+.score-big { font-family:'Space Grotesk',sans-serif !important; font-size:1.5rem; font-weight:800; line-height:1; }
+.score-lbl { font-size:.65rem; color:#475569; margin-top:2px; letter-spacing:.05em; text-transform:uppercase; }
+
+/* ── Signal bars ── */
+.pbar-row { display:flex; align-items:center; gap:8px; margin-bottom:5px; }
+.pbar-label { font-size:.68rem; font-weight:600; color:#64748b; min-width:44px; }
+.pbar-bg { flex:1; height:5px; background:rgba(255,255,255,.06); border-radius:3px; overflow:hidden; }
+.pbar-fill { height:100%; border-radius:3px; transition:width .4s ease; }
+.pbar-val { font-size:.68rem; font-weight:700; color:#94a3b8; min-width:36px; text-align:right; }
+
+/* ── Reasoning box ── */
+.reason-box {
+    background: rgba(255,255,255,.02);
+    border: 1px solid rgba(255,255,255,.07);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: .78rem;
+    color: #94a3b8;
+    line-height: 1.7;
+    margin-top: 10px;
 }
-.pbar-fill { height:6px; border-radius:5px; }
-.pbar-val { color:#94a3b8; font-size:.75rem; min-width:34px; text-align:right; }
-.score-big { font-size:1.1rem; font-weight:800; text-align:right; }
+.reason-box strong { color: #c4b5fd; }
 
-/* skill chip */
-.chip {
-    display:inline-block; padding:3px 9px; border-radius:16px;
-    font-size:.76rem; font-weight:500; margin:2px;
-    background:rgba(99,102,241,.12); color:#a78bfa;
-    border:1px solid rgba(99,102,241,.22);
+/* ── Sidebar ── */
+section[data-testid="stSidebar"] {
+    background: rgba(6,7,20,.7) !important;
+    border-right: 1px solid rgba(255,255,255,.06) !important;
 }
-.chip.matched { background:rgba(34,197,94,.12); color:#4ade80; border-color:rgba(34,197,94,.28); }
-
-/* section divider */
-.sdiv { border:none; border-top:1px solid rgba(255,255,255,.07); margin:18px 0; }
-
-/* sidebar signal table */
+.sidebar-logo {
+    text-align: center;
+    padding: 8px 0 16px;
+}
+.sidebar-logo-title {
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-size: 1.3rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #a78bfa, #67e8f9);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
 .sig-row {
-    display:flex; align-items:center; gap:8px;
-    padding:5px 0; border-bottom:1px solid rgba(255,255,255,.05);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 2px;
 }
-.sig-icon { font-size:1rem; min-width:22px; }
-.sig-name { color:#e2e8f0; font-size:.82rem; font-weight:600; flex:1; }
-.sig-wt {
-    background:rgba(99,102,241,.18); color:#a78bfa;
-    border-radius:10px; padding:1px 8px; font-size:.78rem; font-weight:700;
+.sig-icon { font-size: 1rem; width: 22px; }
+.sig-name { font-size: .82rem; font-weight: 600; color: #e2e8f0; flex: 1; }
+.sig-wt   { font-size: .78rem; font-weight: 700; color: #6366f1;
+             background: rgba(99,102,241,.12); border-radius: 6px;
+             padding: 1px 7px; }
+
+/* ── Cache status ── */
+.cache-panel {
+    background: rgba(255,255,255,.03);
+    border: 1px solid rgba(255,255,255,.08);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-top: 4px;
 }
-.sig-desc { color:#64748b; font-size:.76rem; margin-top:1px; }
+
+/* ── Divider ── */
+.rainbow-divider {
+    height: 2px;
+    background: linear-gradient(90deg, #6366f1, #8b5cf6, #d946ef, #06b6d4, #6366f1);
+    border: none;
+    border-radius: 2px;
+    margin: 24px 0;
+    opacity: .5;
+}
+
+/* ── Progress bar ── */
+.stProgress > div > div > div > div {
+    background: linear-gradient(90deg, #6366f1, #8b5cf6, #06b6d4) !important;
+    border-radius: 4px !important;
+}
+
+/* ── Alerts ── */
+.stSuccess { border-left: 3px solid #22c55e !important; }
+.stInfo    { border-left: 3px solid #6366f1 !important; }
+.stWarning { border-left: 3px solid #f59e0b !important; }
+.stError   { border-left: 3px solid #ef4444 !important; }
+
+/* ── Dataframe ── */
+.stDataFrame { border-radius: 12px !important; overflow: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── SESSION STATE INIT ──────────────────────────────────────────────────────────
+if "file_path" not in st.session_state:
+    st.session_state["file_path"] = ""
+if "cache_stats" not in st.session_state:
+    st.session_state["cache_stats"] = None
 
-# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
+ALLOWED_EXTS  = {".csv", ".xlsx", ".xls", ".json", ".jsonl"}
+
+def validate_path(p: str):
+    p = p.strip()
+    if not p:
+        return None, None
+    ext = os.path.splitext(p)[1].lower()
+    if ext not in ALLOWED_EXTS:
+        return None, f"File type `{ext or 'unknown'}` not supported. Use: {', '.join(sorted(ALLOWED_EXTS))}"
+    if not os.path.isfile(p):
+        return None, f"File not found:\n`{p}`"
+    return p, None
+
+def pct(v): return f"{v*100:.0f}%"
+def score_color(s):
+    if s >= 0.80: return "#4ade80"
+    if s >= 0.65: return "#facc15"
+    if s >= 0.50: return "#fb923c"
+    return "#f87171"
+
+# ── SIDEBAR ─────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🎯 RedRob AI Ranker")
-    st.caption("Intelligent, explainable, fresher-friendly ranking")
+    st.markdown("""
+<div class="sidebar-logo">
+  <div style="font-size:2rem;margin-bottom:6px;">🎯</div>
+  <div class="sidebar-logo-title">RedRob AI</div>
+  <div style="color:#475569;font-size:.72rem;margin-top:2px;">Candidate Intelligence Engine</div>
+</div>
+""", unsafe_allow_html=True)
+
     st.divider()
+    st.markdown("### 🧠 Scoring Model")
+    st.info("**No ML model.** Pure rule-based math — every decision is auditable.", icon="ℹ️")
 
-    st.markdown("### 🧠 How Scoring Works")
-    st.info("**No ML model was trained.** Pure rule-based math — every score is auditable.", icon="ℹ️")
-
-    st.markdown("**6 Scoring Signals:**")
-    signals_info = [
-        ("🎯", "Skill Match",     "35%", "JD skills found in candidate profile"),
-        ("📅", "Experience",      "25%", "YoE curve — freshers boosted"),
-        ("🎓", "Education",       "15%", "Institution tier + field + GPA"),
-        ("📋", "Completeness",    "10%", "Fields filled + GitHub / LinkedIn"),
-        ("📜", "Certifications",  "10%", "ML/AI upskilling evidence"),
-        ("🔍", "Keywords",         "5%", "Implicit JD mentions across full text"),
+    signals = [
+        ("🎯", "Skill Match",    "35%", "#6366f1"),
+        ("📅", "Experience",     "25%", "#22c55e"),
+        ("🎓", "Education",      "15%", "#f59e0b"),
+        ("📋", "Completeness",   "10%", "#06b6d4"),
+        ("📜", "Certifications", "10%", "#a78bfa"),
+        ("🔍", "Keywords",        "5%", "#f43f5e"),
     ]
-    for icon, name, weight, desc in signals_info:
+    for icon, name, wt, color in signals:
         st.markdown(
             f'<div class="sig-row">'
             f'<span class="sig-icon">{icon}</span>'
             f'<span class="sig-name">{name}</span>'
-            f'<span class="sig-wt">{weight}</span>'
-            f'</div>'
-            f'<div style="color:#64748b;font-size:.74rem;padding:1px 0 4px 30px;">{desc}</div>',
+            f'<span class="sig-wt" style="color:{color};background:rgba(0,0,0,.2);">{wt}</span>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
     st.divider()
     st.markdown("### 🌱 Fresher Boost")
-    st.markdown("""
-Candidates with **≤ 2 YoE** get up to **×1.30 bonus** for:
-- GitHub activity
-- Strong certifications
-- Top-tier institution
-- Good skill coverage
-""")
-    st.markdown("Dual-track guarantees **30 fresher slots** in the top 100.")
+    st.markdown("≤ 2 YoE → up to **×1.30 score boost** for GitHub, certs, IIT/BITS/NIT, strong skills.")
+    st.markdown("Top-100 always reserves **30 slots** for freshers.")
 
     st.divider()
-    st.markdown("### 📂 Accepted Formats")
-    st.markdown("""
-- **CSV** — Google Forms export
-- **Excel** — .xlsx / .xls
-- **JSON** — array of objects
-- **JSONL** — challenge format
-""")
-    st.markdown("**Auto-detects** 50+ column name variants — no setup needed.")
-
-    st.divider()
-    st.markdown("### ⚡ Cache Status")
-    if "cache_stats" in st.session_state:
-        cs = st.session_state["cache_stats"]
-        hit  = cs.get("hit", False)
-        icon = "⚡ Cache Hit" if hit else "⚙️ Computed"
-        color = "#22c55e" if hit else "#f59e0b"
+    st.markdown("### ⚡ Cache")
+    cs = st.session_state.get("cache_stats")
+    if cs:
+        hit   = cs.get("hit", False)
+        color = "#4ade80" if hit else "#f59e0b"
+        label = "⚡ Cache Hit" if hit else "⚙️ Computed"
         st.markdown(
-            f'<div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);'
-            f'border-radius:10px;padding:12px 14px;">>'
-            f'<div style="color:{color};font-weight:700;font-size:.9rem;">{icon}</div>'
-            f'<div style="color:#94a3b8;font-size:.78rem;margin-top:4px;">>'
-            f'Parse: {cs.get("parse_ms",0):.0f} ms<br>'
-            f'Rank: {cs.get("rank_ms",0):.0f} ms<br>'
-            f'Total: {cs.get("total_ms",0):.0f} ms'
+            f'<div class="cache-panel">'
+            f'<div style="color:{color};font-weight:700;font-size:.88rem;margin-bottom:6px;">{label}</div>'
+            f'<div style="color:#64748b;font-size:.76rem;line-height:1.8;">'
+            f'Total: <strong style="color:#94a3b8;">{cs.get("total_ms",0):.0f} ms</strong><br>'
+            f'Operation: <strong style="color:#94a3b8;">{cs.get("op_ms",0):.0f} ms</strong>'
             f'</div></div>',
             unsafe_allow_html=True,
         )
     else:
-        st.caption("Run a ranking to see cache stats.")
+        st.caption("Run a ranking to see timing.")
 
     if st.button("🗑️ Clear Cache", use_container_width=True):
-        _cached_parse_bytes.clear()
-        _cached_parse_path.clear()
-        _cached_rank.clear()
-        if "cache_stats" in st.session_state:
-            del st.session_state["cache_stats"]
-        st.success("✅ Cache cleared.")
+        _cached_from_bytes.clear()
+        _cached_from_path.clear()
+        st.session_state["cache_stats"] = None
+        st.success("Cache cleared.")
+
+    st.divider()
+    st.markdown("### 📂 Formats")
+    for fmt, desc in [("CSV","Google Forms / spreadsheet"),("Excel",".xlsx / .xls"),
+                      ("JSON","Array of objects"),("JSONL","Challenge dataset format")]:
+        st.markdown(f"**{fmt}** — {desc}")
 
 
-# ── HEADER ─────────────────────────────────────────────────────────────────────
+# ── HERO ─────────────────────────────────────────────────────────────────────────
 st.markdown("""
-<div class="hero">
-  <h1>🎯 RedRob AI Candidate Ranker</h1>
-  <p>Upload candidate data in <strong>any format</strong> and get a ranked shortlist
-     with full, explainable reasoning — no APIs, no black boxes.</p>
+<div class="hero-wrap">
+  <div class="hero-tag">⚡ AI-Powered · Offline · Explainable</div>
+  <div class="hero-title">Smart Candidate Ranking</div>
+  <div class="hero-sub">
+    Upload your data in any format and get a ranked shortlist in seconds —
+    with full, transparent reasoning. No black boxes. No APIs. No guesswork.
+  </div>
   <div class="pill-row">
-    <span class="pill">📂 CSV · Excel · JSON · JSONL</span>
-    <span class="pill">🧠 6-Signal Scoring</span>
-    <span class="pill">🌱 Fresher-Friendly</span>
-    <span class="pill">🔒 100% Offline</span>
-    <span class="pill">💾 Export CSV / JSON</span>
+    <span class="pill indigo">🧠 6-Signal Scoring</span>
+    <span class="pill cyan">📂 CSV · Excel · JSON · JSONL</span>
+    <span class="pill purple">🌱 Fresher-Friendly</span>
+    <span class="pill green">🔒 100% Offline</span>
+    <span class="pill">💾 Export CSV + JSON</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── INPUT ROW ──────────────────────────────────────────────────────────────────
-left_col, right_col = st.columns([1, 1], gap="large")
+# ── INPUT SECTION ────────────────────────────────────────────────────────────────
+col_file, col_jd = st.columns([1, 1], gap="large")
 
-# Session-state initialisation (runs once)
-if "local_path_val" not in st.session_state:
-    st.session_state["local_path_val"] = ""
+with col_file:
+    st.markdown('<div class="sec-hdr">📂 Candidate Data</div>', unsafe_allow_html=True)
+    st.markdown('<div class="input-panel">', unsafe_allow_html=True)
 
-with left_col:
-    st.markdown("#### 📂 Candidate Data")
-
-    tab_upload, tab_path = st.tabs(["⬆️ Upload File (small files)", "📁 Load from Path (large files)"])
+    tab_up, tab_path = st.tabs(["⬆️ Upload  (small files)", "📁 Local Path  (large files)"])
 
     uploaded_file = None
-    local_path    = None          # will be set below from session_state or text_input
+    local_path    = None
+    path_error    = None
 
-    with tab_upload:
+    with tab_up:
         st.caption("Best for CSV / Excel / JSON under ~100 MB")
         uploaded_file = st.file_uploader(
             "Drop your file here",
             type=["csv", "xlsx", "xls", "json", "jsonl"],
-            help="Google Forms CSV, spreadsheet, JSON array or JSONL",
             label_visibility="collapsed",
         )
         if uploaded_file:
             st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB")
 
     with tab_path:
-        st.caption("Use this for large files (400 MB+) already on your computer")
+        st.caption("For large files already on this machine (400 MB+)")
 
-        DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
-
-        # ── Only check extension — this is a local single-user app ──
-        ALLOWED_EXTS = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
-
-        def _safe_path(p: str):
-            """Return (ok, reason). Validates extension and that file exists."""
-            p = p.strip()
-            if not p:
-                return False, "No path entered."
-            ext = os.path.splitext(p)[1].lower()
-            if ext not in ALLOWED_EXTS:
-                return False, (
-                    f"File type `{ext or 'unknown'}` not supported. "
-                    f"Allowed: {', '.join(sorted(ALLOWED_EXTS))}"
-                )
-            if not os.path.isfile(p):
-                return False, f"File not found: `{p}`"
-            return True, ""
-
-        # One-click quick-fill button — stores path in session_state
+        # ── Quick-fill button ──────────────────────────────────────────
         if os.path.isfile(DEFAULT_JSONL):
-            if st.button("📂 Use challenge dataset  (candidates.jsonl — 465 MB)",
+            if st.button("📂 Load challenge dataset  (candidates.jsonl — 465 MB)",
                          use_container_width=True):
-                st.session_state["local_path_val"] = DEFAULT_JSONL
+                # Write directly to session_state key the text_input uses
+                st.session_state["_path_input_widget"] = DEFAULT_JSONL
 
-        # Text input — pre-filled from session_state so quick-fill works instantly
-        typed = st.text_input(
-            "Or paste any file path:",
-            value=st.session_state["local_path_val"],
+        # ── Path text input ────────────────────────────────────────────
+        # KEY FIX: use the widget's own key to pre-fill it from the button above.
+        # st.session_state["_path_input_widget"] is written by the button,
+        # and Streamlit reads it as the widget's current value on re-render.
+        raw_path = st.text_input(
+            "Full file path",
             placeholder=DEFAULT_JSONL,
-            key="path_text_input",
+            label_visibility="collapsed",
+            key="_path_input_widget",          # widget manages its own state
         )
-        # Always sync typed value back to session_state
-        st.session_state["local_path_val"] = typed.strip()
 
-        # Validate and expose
-        _raw_path = st.session_state["local_path_val"]
-        if _raw_path:
-            ok, reason = _safe_path(_raw_path)
-            if not ok:
-                st.error(f"❌ {reason}")
-                local_path = None
+        # ── Validate ───────────────────────────────────────────────────
+        if raw_path and raw_path.strip():
+            local_path, path_error = validate_path(raw_path.strip())
+            if local_path:
+                sz = os.path.getsize(local_path) / 1024 / 1024
+                st.success(f"✅ **{os.path.basename(local_path)}** — {sz:.1f} MB  ·  ready to rank")
             else:
-                size_mb = os.path.getsize(_raw_path) / 1024 / 1024
-                st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
-                local_path = _raw_path
-        else:
-            local_path = None
+                st.error(f"❌ {path_error}")
 
+    st.markdown('</div>', unsafe_allow_html=True)
 
-with right_col:
-    st.markdown("#### 📝 Job Description")
-    DEFAULT_JD = """Software / AI Engineer (General Tech Hiring)
+with col_jd:
+    st.markdown('<div class="sec-hdr">📝 Job Description</div>', unsafe_allow_html=True)
+    st.markdown('<div class="input-panel">', unsafe_allow_html=True)
 
-We are hiring across engineering, data, AI, and product roles.
+    DEFAULT_JD = """Software / Data / AI Engineer — General Tech Hiring
 
 Core Skills Required:
-- Python or Java or JavaScript or Go
-- REST APIs, Microservices, SQL
-- Cloud platforms: AWS or Azure or GCP
-- Agile / Scrum methodologies
-- Problem-solving and system design
+- Python, Java, JavaScript, Go, or TypeScript
+- REST APIs, Microservices, SQL, system design
+- Cloud: AWS, Azure, or GCP
+- Agile / Scrum, Git, CI/CD
 
-Preferred / Additional Skills:
-- Machine learning, NLP, or data science
-- DevOps: Docker, Kubernetes, CI/CD
-- Frontend: React, TypeScript
-- Data engineering: Spark, Kafka, Hadoop
-- Mobile: Android or iOS development
+Preferred Skills:
+- Machine learning, NLP, deep learning
+- Docker, Kubernetes, DevOps
+- React, TypeScript (frontend)
+- Spark, Kafka, Hadoop (data engineering)
+- Mobile: Android or iOS
 
-Education: Any engineering or CS background
-Experience: 0–10 years (freshers welcome)
-Location: India preferred, open to remote"""
+Education: Engineering / CS background
+Experience: 0–10 years (freshers very welcome)"""
 
     jd_text = st.text_area(
         "Job Description",
         value=DEFAULT_JD,
-        height=260,
+        height=278,
         label_visibility="collapsed",
+        placeholder="Paste your job description here…",
     )
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ── RUN BUTTON ─────────────────────────────────────────────────────────────────
+
+# ── RUN BUTTON ──────────────────────────────────────────────────────────────────
 st.markdown("")
-btn_col, _ = st.columns([1, 4])
-with btn_col:
+bc, _ = st.columns([1, 3])
+with bc:
     run_btn = st.button("🚀 Rank Candidates", type="primary", use_container_width=True)
 
+has_file = (uploaded_file is not None) or (local_path is not None)
 
-# ── RESULTS ────────────────────────────────────────────────────────────────────
-has_file = (uploaded_file is not None) or bool(local_path)
+# ── VALIDATION MESSAGES ──────────────────────────────────────────────────────────
+if run_btn and not has_file:
+    if path_error:
+        st.error(f"❌ {path_error}")
+    else:
+        st.warning("⚠️ Please upload a file or enter a valid file path.")
+elif run_btn and not jd_text.strip():
+    st.warning("⚠️ Please enter a job description.")
 
+
+# ── RANKING ─────────────────────────────────────────────────────────────────────
 if run_btn and has_file and jd_text.strip():
 
-    _t_start = time.perf_counter()
+    _t0 = time.perf_counter()
 
-    with st.spinner("⚡ Loading from cache or computing…"):
+    with st.spinner("⚡ Checking cache or computing ranking…"):
 
         if uploaded_file is not None:
-            # ── Browser upload ──
             raw   = uploaded_file.read()
             fname = uploaded_file.name
-
-            progress_bar  = st.progress(0, text="⚡ Parsing + ranking…")
-            _has_progress = True
-
-            _t0 = time.perf_counter()
+            pb = st.progress(0, text="⚡ Parsing + ranking…")
             ranked, jd_skills = _cached_from_bytes(raw, fname, jd_text)
-            _op_ms = (time.perf_counter() - _t0) * 1000
-
-            progress_bar.progress(100, text="✅ Done!")
+            pb.progress(100, text="✅ Done!")
 
         else:
-            # ── Local file path ──
-            fname  = os.path.basename(local_path)
-            stat   = os.stat(local_path)
-
-            progress_bar  = st.progress(0, text="⚡ Checking cache / reading file…")
-            _has_progress = True
-
-            _t0 = time.perf_counter()
+            fname = os.path.basename(local_path)
+            stat  = os.stat(local_path)
+            pb = st.progress(0, text="⚡ Checking cache / reading file…")
             ranked, jd_skills = _cached_from_path(
                 local_path, stat.st_mtime, stat.st_size, fname, jd_text
             )
-            _op_ms = (time.perf_counter() - _t0) * 1000
+            pb.progress(100, text="✅ Done — ranked!")
 
-            progress_bar.progress(100, text="✅ Done — ranked!")
-
-    if not ranked:
-        st.error("❌ Could not parse the file or no candidates found. Check the format.")
-        st.stop()
-
-    _total_ms   = (time.perf_counter() - _t_start) * 1000
-    _from_cache = _op_ms < 80     # <80ms almost certainly a cache hit
+    _total_ms = (time.perf_counter() - _t0) * 1000
+    _from_cache = _total_ms < 80
 
     st.session_state["cache_stats"] = {
         "hit":      _from_cache,
-        "parse_ms": 0,
-        "rank_ms":  _op_ms,
         "total_ms": _total_ms,
+        "op_ms":    _total_ms,
     }
 
+    if not ranked:
+        st.error("❌ No candidates found. Check the file format.")
+        st.stop()
+
     if _from_cache:
-        st.success(f"⚡ **From cache** — instant result in {_total_ms:.0f} ms!")
+        st.success(f"⚡ **Instant from cache** — {_total_ms:.0f} ms (no recompute needed)")
     else:
-        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — cached for next run.")
+        st.info(f"⚙️ Ranked in **{_total_ms:.0f} ms** — cached for next run")
 
+    # ── METRICS ──────────────────────────────────────────────────────
+    st.markdown('<hr class="rainbow-divider">', unsafe_allow_html=True)
+    st.markdown("## 📊 Ranking Results")
 
-    # ── STATS ─────────────────────────────────────────────────────
-    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
-    st.markdown("## 📊 Ranking Complete")
+    total_c   = len(ranked)
+    top_score = ranked[0]["final_score"] if ranked else 0
+    avg_score = sum(r["final_score"] for r in ranked) / max(1, total_c)
+    freshers  = sum(1 for r in ranked if r["is_fresher"])
+    jd_count  = len(jd_skills)
+    avg_exp   = sum(float(str(r.get("yoe","0")).split()[0]) if str(r.get("yoe","0")).replace(".","",1).isdigit() else 0 for r in ranked) / max(1, total_c)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Candidates", f"{len(ranked):,}")
-    m2.metric("Top Score",  f"{ranked[0]['final_score']:.3f}" if ranked else "—")
-    m3.metric("Avg Score",  f"{sum(r['final_score'] for r in ranked)/max(1,len(ranked)):.3f}")
-    m4.metric("Freshers 🌱", sum(1 for r in ranked if r["is_fresher"]))
-    m5.metric("JD Skills",  len(jd_skills))
+    metrics = [
+        ("mc-indigo",  "Candidates",  f"{total_c:,}",        "total ranked"),
+        ("mc-cyan",    "Top Score",   f"{top_score:.3f}",     "best match"),
+        ("mc-purple",  "Avg Score",   f"{avg_score:.3f}",     "across all"),
+        ("mc-green",   "Freshers 🌱", f"{freshers}",          f"of {min(total_c,100)} top"),
+        ("mc-amber",   "JD Skills",   f"{jd_count}",          "extracted"),
+    ]
+    cols = st.columns(5)
+    for col, (cls, label, val, sub) in zip(cols, metrics):
+        with col:
+            st.markdown(
+                f'<div class="metric-card {cls}">'
+                f'<div class="metric-label">{label}</div>'
+                f'<div class="metric-value">{val}</div>'
+                f'<div class="metric-sub">{sub}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-    # ── JD SKILLS CHIPS ───────────────────────────────────────────
-    with st.expander("🔍 Skills extracted from Job Description", expanded=False):
-        chip_html = "".join(
-            f'<span class="chip">{s}</span>' for s in jd_skills[:50]
+    # ── JD SKILLS ────────────────────────────────────────────────────
+    if jd_skills:
+        st.markdown("")
+        skill_html = " ".join(
+            f'<span style="background:rgba(99,102,241,.14);border:1px solid rgba(99,102,241,.3);'
+            f'border-radius:16px;padding:3px 11px;font-size:.75rem;font-weight:600;color:#a78bfa;'
+            f'display:inline-block;margin:2px;">{html_mod.escape(s)}</span>'
+            for s in sorted(jd_skills)
         )
-        st.markdown(chip_html, unsafe_allow_html=True)
-        st.caption(f"{len(jd_skills)} skills identified from the job description text.")
+        st.markdown(f"**Skills extracted from JD:** {skill_html}", unsafe_allow_html=True)
 
-    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    # ── CANDIDATE CARDS ───────────────────────────────────────────────
+    st.markdown('<hr class="rainbow-divider">', unsafe_allow_html=True)
 
-    # ── RANKED LIST ───────────────────────────────────────────────
-    st.markdown("## 🏆 Ranked Candidates")
+    top_n = min(len(ranked), 100)
+    disp_col, _ = st.columns([3, 1])
+    with disp_col:
+        show_n = st.slider("Candidates to display", 5, top_n, min(25, top_n), 5)
 
-    RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for r in ranked[:show_n]:
+        rk    = r["rank"]
+        score = r["final_score"]
+        col   = score_color(score)
 
-    def score_bar_color(score):
-        if score >= 0.75: return "#22c55e"
-        if score >= 0.55: return "#6366f1"
-        if score >= 0.35: return "#f59e0b"
-        return "#ef4444"
+        if rk == 1:   card_cls = "gold"
+        elif rk == 2: card_cls = "silver"
+        elif rk == 3: card_cls = "bronze"
+        elif rk <= 10: card_cls = "top"
+        else:          card_cls = ""
 
-    def pct_str(score):
-        return f"{score*100:.0f}%"
+        if rk == 1:   rank_label = "🥇"
+        elif rk == 2: rank_label = "🥈"
+        elif rk == 3: rank_label = "🥉"
+        else:          rank_label = f"#{rk}"
 
-    for r in ranked:
-        rank = r["rank"]
-        is_fresh = r["is_fresher"]
-        is_top3  = rank <= 3
-
-        card_class = "gold" if is_top3 else ("green" if is_fresh else "")
-        rank_label = RANK_EMOJI.get(rank, f"#{rank}")
-
-        # badges
         badges = ""
-        if is_top3:
-            badges += '<span class="cbadge b-top">⭐ Top 3</span>'
-        if is_fresh:
-            badges += '<span class="cbadge b-fresh">🌱 Fresher</span>'
-        if r["fresher_uplift"] > 1.0:
+        if r.get("is_fresher"):      badges += '<span class="cbadge b-fresh">🌱 Fresher</span>'
+        if rk <= 10:                 badges += '<span class="cbadge b-top">⭐ Top 10</span>'
+        if r.get("fresher_uplift",1) > 1.05:
             badges += f'<span class="cbadge b-boost">×{r["fresher_uplift"]:.2f} Boost</span>'
 
-        # meta line
-        # ── XSS protection: escape ALL user-supplied data before HTML rendering ──
         name     = html_mod.escape(r.get("name") or r.get("candidate_id", "—"))
         title    = html_mod.escape(r.get("title", ""))
         company  = html_mod.escape(r.get("company", ""))
         location = html_mod.escape(r.get("location", ""))
         yoe_val  = r.get("yoe", "")
 
-        meta_parts = []
-        if title:   meta_parts.append(title)
-        if company: meta_parts.append(f"@ {company}")
-        if yoe_val is not None and yoe_val != "": meta_parts.append(f"• {yoe_val} YoE")
-        if location: meta_parts.append(f"• 📍 {location}")
-        meta_str = "  ".join(meta_parts)
+        meta = []
+        if title:   meta.append(title)
+        if company: meta.append(f"@ {company}")
+        if yoe_val not in (None, "", "N/A"): meta.append(f"• {yoe_val} YoE")
+        if location: meta.append(f"• 📍 {location}")
+        meta_str = "  &nbsp;".join(meta)
 
-        # signal mini-bars (HTML)
-        bar_color = score_bar_color(r["final_score"])
-        signals_html = ""
+        # Signal bars
+        bars_html = ""
         for sig_name, sig_key, sig_color in [
-            ("Skill",  "skill_score",          "#6366f1"),
-            ("Exp",    "experience_score",      "#22c55e"),
-            ("Edu",    "education_score",       "#f59e0b"),
-            ("Certs",  "certification_score",   "#a78bfa"),
+            ("Skill",  "skill_score",        "#6366f1"),
+            ("Exp",    "experience_score",    "#22c55e"),
+            ("Edu",    "education_score",     "#f59e0b"),
+            ("Certs",  "certification_score", "#a78bfa"),
         ]:
             sv = r.get(sig_key, 0)
-            signals_html += (
+            bars_html += (
                 f'<div class="pbar-row">'
                 f'<span class="pbar-label">{sig_name}</span>'
                 f'<div class="pbar-bg"><div class="pbar-fill" '
-                f'style="width:{pct_str(sv)};background:{sig_color};"></div></div>'
-                f'<span class="pbar-val">{pct_str(sv)}</span>'
+                f'style="width:{pct(sv)};background:{sig_color};"></div></div>'
+                f'<span class="pbar-val">{pct(sv)}</span>'
                 f'</div>'
             )
 
         card_html = f"""
-<div class="ccard {card_class}">
+<div class="ccard {card_cls}">
   <div style="display:flex;gap:16px;align-items:flex-start;">
-    <div style="min-width:48px;text-align:center;padding-top:2px;">
+    <div class="rank-badge">
       <div class="rank-num">{rank_label}</div>
     </div>
     <div style="flex:1;min-width:0;">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:2px;">
         <span class="cname">{name}</span>
         {badges}
       </div>
       <div class="cmeta">{meta_str}</div>
-      {signals_html}
+      {bars_html}
     </div>
-    <div style="min-width:64px;text-align:right;">
-      <div class="score-big" style="color:{bar_color};">{r['final_score']:.4f}</div>
-      <div style="color:#64748b;font-size:.72rem;margin-top:2px;">Score</div>
+    <div class="score-wrap">
+      <div class="score-big" style="color:{col};">{score:.3f}</div>
+      <div class="score-lbl">Score</div>
     </div>
   </div>
 </div>
 """
         st.markdown(card_html, unsafe_allow_html=True)
 
-        # Expandable breakdown
-        with st.expander(f"📋 Why #{rank}? — Full scoring breakdown"):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.markdown("**Signal Breakdown**")
-                sigs = [
-                    ("🎯 Skill Match",    r["skill_score"],          "#6366f1"),
-                    ("📅 Experience",     r["experience_score"],     "#22c55e"),
-                    ("🎓 Education",      r["education_score"],      "#f59e0b"),
-                    ("📋 Completeness",   r["completeness_score"],   "#94a3b8"),
-                    ("📜 Certifications", r["certification_score"],  "#a78bfa"),
-                    ("🔍 Keywords",       r["keyword_score"],        "#64748b"),
-                ]
-                for sig_label, sig_val, sig_col in sigs:
-                    filled = int(sig_val * 20)
-                    bar_s  = "█" * filled + "░" * (20 - filled)
-                    st.markdown(
-                        f'{sig_label}: <code style="color:{sig_col}">{bar_s}</code> '
-                        f'`{sig_val:.3f}`',
-                        unsafe_allow_html=True,
-                    )
-                if r["fresher_uplift"] > 1.0:
-                    st.success(f"🚀 Fresher Boost applied: ×{r['fresher_uplift']:.3f}")
+        # Expandable reasoning
+        with st.expander(f"📋 Full reasoning — {name}", expanded=False):
+            reason = r.get("reasoning", "")
+            parts  = reason.split(" || ")
+            cols_r = st.columns(2)
+            for i, part in enumerate(parts):
+                with cols_r[i % 2]:
+                    if ":" in part:
+                        key_r, val_r = part.split(":", 1)
+                        st.markdown(f"**{key_r.strip()}**: {val_r.strip()}")
+                    else:
+                        st.markdown(part)
 
-            with col_b:
-                st.markdown("**Reasoning**")
-                for chunk in r.get("reasoning", "").split(" || "):
-                    if ":" in chunk:
-                        tag, _, detail = chunk.partition(": ")
-                        st.markdown(f"**{tag}**: {detail}")
+            # Sub-scores table
+            sub = {
+                "Signal": ["Skill", "Experience", "Education", "Completeness", "Certifications", "Keywords"],
+                "Score":  [
+                    f"{r.get('skill_score',0):.3f}",
+                    f"{r.get('experience_score',0):.3f}",
+                    f"{r.get('education_score',0):.3f}",
+                    f"{r.get('completeness_score',0):.3f}",
+                    f"{r.get('certification_score',0):.3f}",
+                    f"{r.get('keyword_score',0):.3f}",
+                ],
+                "Weight": ["35%","25%","15%","10%","10%","5%"],
+            }
+            st.dataframe(pd.DataFrame(sub), hide_index=True, use_container_width=True)
 
-    # ── DOWNLOAD ──────────────────────────────────────────────────
-    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
-    st.markdown("### 💾 Download Results")
+    # ── EXPORT ───────────────────────────────────────────────────────
+    st.markdown('<hr class="rainbow-divider">', unsafe_allow_html=True)
+    st.markdown("### 💾 Export Results")
 
     rows = [{
-        "rank": r["rank"], "candidate_id": r["candidate_id"],
-        "name": r.get("name",""), "title": r.get("title",""),
-        "company": r.get("company",""), "location": r.get("location",""),
-        "yoe": r.get("yoe",""), "is_fresher": r["is_fresher"],
-        "final_score": r["final_score"],
-        "skill_score": r["skill_score"], "experience_score": r["experience_score"],
-        "education_score": r["education_score"], "completeness_score": r["completeness_score"],
-        "certification_score": r["certification_score"], "keyword_score": r["keyword_score"],
-        "fresher_uplift": r["fresher_uplift"],
-        "skill_match_detail": r["skill_match_detail"],
-        "experience_detail": r["experience_detail"],
-        "education_detail": r["education_detail"],
-        "certification_detail": r["certification_detail"],
-        "reasoning": r["reasoning"],
+        "rank":            r["rank"],
+        "candidate_id":    r["candidate_id"],
+        "name":            r.get("name",""),
+        "title":           r.get("title",""),
+        "company":         r.get("company",""),
+        "yoe":             r.get("yoe",""),
+        "is_fresher":      r["is_fresher"],
+        "final_score":     r["final_score"],
+        "skill_score":     r["skill_score"],
+        "experience_score":r["experience_score"],
+        "education_score": r["education_score"],
+        "completeness_score": r["completeness_score"],
+        "certification_score":r["certification_score"],
+        "keyword_score":   r["keyword_score"],
+        "fresher_uplift":  r["fresher_uplift"],
+        "reasoning":       r["reasoning"],
     } for r in ranked]
 
     df_exp = pd.DataFrame(rows)
-    dc1, dc2, _ = st.columns([1, 1, 2])
-    with dc1:
+    ec1, ec2, _ = st.columns([1, 1, 2])
+    with ec1:
         st.download_button("⬇️ Download CSV",
             df_exp.to_csv(index=False).encode(),
             "ranked_candidates.csv", "text/csv",
             use_container_width=True)
-    with dc2:
+    with ec2:
         st.download_button("⬇️ Download JSON",
-            json.dumps(rows, indent=2, default=str).encode(),
+            json.dumps(rows, indent=2).encode(),
             "ranked_candidates.json", "application/json",
             use_container_width=True)
 
-    with st.expander("📊 View as Table"):
+    # ── FULL TABLE ────────────────────────────────────────────────────
+    with st.expander("📊 View full ranked table", expanded=False):
         st.dataframe(df_exp[[
             "rank","name","title","company","yoe","is_fresher",
             "final_score","skill_score","experience_score","education_score",
@@ -616,36 +846,34 @@ if run_btn and has_file and jd_text.strip():
             "skill_score":"Skill","experience_score":"Exp","education_score":"Edu",
         }), hide_index=True, use_container_width=True)
 
-elif run_btn and not has_file:
-    st.warning("⚠️ Please upload a file or paste a file path first.")
-elif run_btn and not jd_text.strip():
-    st.warning("⚠️ Please enter a job description before ranking.")
-else:
-    # ── GETTING STARTED ───────────────────────────────────────────
-    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+
+# ── GETTING STARTED (no data yet) ────────────────────────────────────────────────
+elif not run_btn:
+    st.markdown('<hr class="rainbow-divider">', unsafe_allow_html=True)
     st.markdown("### 👋 Getting Started")
+
     ga, gb = st.columns(2)
     with ga:
-        st.markdown("**Sample Google Forms CSV columns:**")
+        st.markdown("**Sample Google Forms CSV structure:**")
         st.dataframe(pd.DataFrame({
-            "Your Name":             ["Priya Sharma",  "Rahul Mehta"],
-            "Years of Experience":   ["0",             "5"],
-            "Technical Skills":      ["Python, PyTorch, NLP", "Python, FAISS, MLOps"],
-            "College / University":  ["IIT Bombay",    "NIT Trichy"],
-            "CGPA / Percentage":     ["9.2 CGPA",      "75%"],
-            "Certifications":        ["DeepLearning.AI", "AWS ML Specialty"],
-            "GitHub Profile":        ["github.com/ps", "github.com/rm"],
+            "Your Name":           ["Priya Sharma",    "Rahul Mehta"],
+            "Years of Experience": ["0",               "5"],
+            "Technical Skills":    ["Python, PyTorch", "Java, AWS"],
+            "College":             ["IIT Bombay",      "NIT Trichy"],
+            "CGPA":                ["9.2",             "8.1"],
+            "Certifications":      ["DeepLearning.AI", "AWS ML"],
+            "GitHub":              ["github.com/ps",   "github.com/rm"],
         }), hide_index=True, use_container_width=True)
 
     with gb:
-        st.markdown("**What you'll get per candidate:**")
+        st.markdown("**What you get per candidate:**")
         st.markdown("""
-- 🏆 **Final rank** (1–N) with composite score
-- 🎯 **Skill match %** — which JD skills were found
-- 📅 **Experience score** — YoE curve with fresher boost
+- 🏆 **Final rank** with composite 0–1 score
+- 🎯 **Skill match** — which JD skills were found
+- 📅 **Experience score** — YoE curve + fresher boost
 - 🎓 **Education score** — institution tier + GPA
-- 📜 **Certification score** — ML upskilling signals
-- 📋 **Full reasoning** — every score explained in plain text
-- 💾 **Downloadable** CSV + JSON output
+- 📜 **Certification score** — upskilling evidence
+- 📋 **Full reasoning** — every sub-score explained
+- 💾 **CSV + JSON** export ready
 """)
-        st.info("The system auto-detects column names — no manual mapping needed.", icon="✨")
+        st.info("Auto-detects 50+ column name variants — no setup needed.", icon="✨")
