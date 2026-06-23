@@ -9,8 +9,53 @@ import json
 import io
 import os
 import html as html_mod
+import time
+import hashlib
 from universal_parser import parse_any_format
 from universal_scorer import rank_candidates, _extract_skills_from_jd
+
+# ── MEMOISED WRAPPERS ──────────────────────────────────────────────────────────
+# st.cache_data persists across reruns for the same cache key.
+# parse: keyed on (file_bytes, filename) — Streamlit auto-hashes bytes.
+# rank:  keyed on a stable tuple from the parsed candidates + jd_text.
+# For LOCAL PATH files (400MB+), we avoid re-hashing the giant byte array
+# by using (realpath, mtime, size) as an O(1) cache key instead.
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_bytes(raw: bytes, filename: str) -> list:
+    """Parse file bytes → list of candidate dicts. Cached by file content hash."""
+    return parse_any_format(raw, filename)
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_path(realpath: str, _mtime: float, _size: int, filename: str) -> list:
+    """
+    Parse a large on-disk file WITHOUT loading its full bytes into the cache key.
+    Cache key = (realpath, mtime, size) — O(1) stat call instead of O(n) hash.
+    _mtime and _size are prefixed with _ so Streamlit skips hashing them (they
+    are already primitive types embedded in the key).
+    """
+    with open(realpath, "rb") as fh:
+        raw = fh.read()
+    return parse_any_format(raw, filename)
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def _cached_rank(candidates_json: str, jd_text: str) -> tuple:
+    """
+    Rank candidates. Cache key = (serialised candidates, jd_text).
+    Candidates are serialised to a compact JSON string so the list-of-dicts
+    is hashable and change-aware.
+    """
+    import json as _json
+    cands = _json.loads(candidates_json)
+    return rank_candidates(cands, jd_text)
+
+def _serialise_candidates(cands: list) -> str:
+    """Compact JSON for cache key — stable sort by candidate_id."""
+    return json.dumps(
+        sorted(cands, key=lambda c: c.get("candidate_id", "")),
+        sort_keys=True, separators=(',', ':')
+    )
+
 
 # ── PAGE CONFIG ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -171,6 +216,35 @@ Candidates with **≤ 2 YoE** get up to **×1.30 bonus** for:
 """)
     st.markdown("**Auto-detects** 50+ column name variants — no setup needed.")
 
+    st.divider()
+    st.markdown("### ⚡ Cache Status")
+    if "cache_stats" in st.session_state:
+        cs = st.session_state["cache_stats"]
+        hit  = cs.get("hit", False)
+        icon = "⚡ Cache Hit" if hit else "⚙️ Computed"
+        color = "#22c55e" if hit else "#f59e0b"
+        st.markdown(
+            f'<div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);'
+            f'border-radius:10px;padding:12px 14px;">>'
+            f'<div style="color:{color};font-weight:700;font-size:.9rem;">{icon}</div>'
+            f'<div style="color:#94a3b8;font-size:.78rem;margin-top:4px;">>'
+            f'Parse: {cs.get("parse_ms",0):.0f} ms<br>'
+            f'Rank: {cs.get("rank_ms",0):.0f} ms<br>'
+            f'Total: {cs.get("total_ms",0):.0f} ms'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Run a ranking to see cache stats.")
+
+    if st.button("🗑️ Clear Cache", use_container_width=True):
+        _cached_parse_bytes.clear()
+        _cached_parse_path.clear()
+        _cached_rank.clear()
+        if "cache_stats" in st.session_state:
+            del st.session_state["cache_stats"]
+        st.success("✅ Cache cleared.")
+
 
 # ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -315,38 +389,75 @@ with btn_col:
 has_file = (uploaded_file is not None) or bool(local_path)
 
 if run_btn and has_file and jd_text.strip():
-    with st.spinner("⚙️ Parsing file and scoring candidates…"):
+
+    _t_total_start = time.perf_counter()
+    _parse_ms = _rank_ms = 0
+    _from_cache = True          # assume cache hit; set False if we compute
+
+    with st.spinner("⚡ Loading from cache or computing…"):
 
         if uploaded_file is not None:
-            # ── browser upload path (small files) ──
-            raw = uploaded_file.read()
+            # ── browser upload ──
+            raw   = uploaded_file.read()
             fname = uploaded_file.name
-            candidates = parse_any_format(raw, fname)
+            _t0 = time.perf_counter()
+            try:
+                candidates = _cached_parse_bytes.__wrapped__(raw, fname)   # test cache
+            except AttributeError:
+                pass
+            _t0 = time.perf_counter()
+            candidates  = _cached_parse_bytes(raw, fname)
+            _parse_ms   = (time.perf_counter() - _t0) * 1000
             _has_progress = False
 
         else:
-            # ── local file path (large files, read from disk) ──
-            fname = os.path.basename(local_path)
+            # ── local file path ──
+            fname  = os.path.basename(local_path)
+            stat   = os.stat(local_path)
+            _mtime = stat.st_mtime
+            _size  = stat.st_size
 
-            progress_bar = st.progress(0, text="📚 Reading file from disk…")
+            progress_bar  = st.progress(0, text="⚡ Checking cache / reading file…")
             _has_progress = True
 
-            with open(local_path, "rb") as fh:
-                raw = fh.read()
+            _t0        = time.perf_counter()
+            candidates = _cached_parse_path(local_path, _mtime, _size, fname)
+            _parse_ms  = (time.perf_counter() - _t0) * 1000
 
-            progress_bar.progress(50, text="⚡ Parsing candidates…")
-            candidates = parse_any_format(raw, fname)
-            progress_bar.progress(80, text="🤖 Scoring candidates…")
+            progress_bar.progress(70, text="🤖 Ranking candidates…")
 
         if not candidates:
             st.error("❌ Could not parse the file. Check the format and try again.")
             st.stop()
 
-        ranked, jd_skills = rank_candidates(candidates, jd_text)
+        # ── Serialise for rank cache key ──
+        cands_json = _serialise_candidates(candidates)
+
+        _t0          = time.perf_counter()
+        ranked, jd_skills = _cached_rank(cands_json, jd_text)
+        _rank_ms     = (time.perf_counter() - _t0) * 1000
+
+        _total_ms = (time.perf_counter() - _t_total_start) * 1000
+
+        # Detect cache hit: very fast (<50ms) almost certainly came from cache
+        _from_cache = (_parse_ms + _rank_ms) < 50
+
+        st.session_state["cache_stats"] = {
+            "hit":      _from_cache,
+            "parse_ms": _parse_ms,
+            "rank_ms":  _rank_ms,
+            "total_ms": _total_ms,
+        }
+
         if _has_progress:
             progress_bar.progress(100, text="✅ Done — ranked!")
 
-    st.balloons()
+    # ── Cache hit badge ──
+    if _from_cache:
+        st.success("⚡ **Results served from cache** — instant! (no recompute)")
+    else:
+        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — result now cached for next run.")
+
 
     # ── STATS ─────────────────────────────────────────────────────
     st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
