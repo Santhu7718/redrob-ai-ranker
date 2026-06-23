@@ -3,7 +3,21 @@ headless = true
 port = 8501
 enableCORS = false
 enableXsrfProtection = false
-maxUploadSize = 1000
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+
+[runner]
+# Prevent unnecessary reruns that slow initial load
+fastReruns = true
+enforceSerializableSessionState = false
+
+[client]
+# Show a loading spinner immediately on cold start
+showErrorDetails = false
+toolbarMode = "minimal"
 
 [theme]
 base = "dark"

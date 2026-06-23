@@ -1,654 +1,680 @@
-#!/usr/bin/env python3
 """
-app.py — RedRob AI Ranker Web Server  (Multi-Format Edition)
-=============================================================
-Supported upload formats:
-  .jsonl  — Primary format (one JSON object per line)
-  .json   — JSON array of candidate objects
-  .csv    — Tabular candidate data (columns auto-mapped)
-  .xlsx   — Excel workbook (first sheet)
-  .xls    — Legacy Excel workbook
-  .pdf    — PDF with embedded JSONL or plain-text candidates
-  .txt    — Plain text, treated as JSONL lines
-  .tsv    — Tab-separated values
-
-Usage:
-    source venv/bin/activate
-    python app.py
-    → visit http://localhost:8765
+app.py — RedRob AI Candidate Ranker
+Streamlit UI — fixed rendering, clean layout, no raw HTML leaks.
 """
 
-import os
-import sys
+import streamlit as st
+import pandas as pd
 import json
-import uuid
-import csv
 import io
-import re
+import os
+import html as html_mod
 import time
-import threading
-import logging
-from pathlib import Path
+import hashlib
+from universal_parser import parse_any_format
+from universal_scorer import rank_candidates, _extract_skills_from_jd
 
-from flask import Flask, request, jsonify, send_from_directory, make_response
+# ── MEMOISED WRAPPERS ──────────────────────────────────────────────────────────
+# st.cache_data persists across reruns for the same cache key.
+# parse: keyed on (file_bytes, filename) — Streamlit auto-hashes bytes.
+# rank:  keyed on a stable tuple from the parsed candidates + jd_text.
+# For LOCAL PATH files (400MB+), we avoid re-hashing the giant byte array
+# by using (realpath, mtime, size) as an O(1) cache key instead.
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.resolve()
-WEB_DIR  = BASE_DIR / "web"
-sys.path.insert(0, str(BASE_DIR))
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_bytes(raw: bytes, filename: str) -> list:
+    """Parse file bytes → list of candidate dicts. Cached by file content hash."""
+    return parse_any_format(raw, filename)
 
-app = Flask(__name__, static_folder=str(WEB_DIR))
-app.config["MAX_CONTENT_LENGTH"] = 600 * 1024 * 1024  # 600 MB
+@st.cache_data(show_spinner=False, max_entries=3)
+def _cached_parse_path(realpath: str, _mtime: float, _size: int, filename: str) -> list:
+    """
+    Parse a large on-disk file WITHOUT loading its full bytes into the cache key.
+    Cache key = (realpath, mtime, size) — O(1) stat call instead of O(n) hash.
+    _mtime and _size are prefixed with _ so Streamlit skips hashing them (they
+    are already primitive types embedded in the key).
+    """
+    with open(realpath, "rb") as fh:
+        raw = fh.read()
+    return parse_any_format(raw, filename)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+@st.cache_data(show_spinner=False, max_entries=5)
+def _cached_rank(candidates_json: str, jd_text: str) -> tuple:
+    """
+    Rank candidates. Cache key = (serialised candidates, jd_text).
+    Candidates are serialised to a compact JSON string so the list-of-dicts
+    is hashable and change-aware.
+    """
+    import json as _json
+    cands = _json.loads(candidates_json)
+    return rank_candidates(cands, jd_text)
+
+def _serialise_candidates(cands: list) -> str:
+    """Compact JSON for cache key — stable sort by candidate_id."""
+    return json.dumps(
+        sorted(cands, key=lambda c: c.get("candidate_id", "")),
+        sort_keys=True, separators=(',', ':')
+    )
+
+
+# ── PAGE CONFIG ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="RedRob AI Candidate Ranker",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-log = logging.getLogger("redrob-web")
 
-# Supported extensions → MIME types
-SUPPORTED_EXTENSIONS = {
-    ".jsonl", ".json", ".csv", ".tsv",
-    ".xlsx", ".xls", ".pdf", ".txt",
+# ── GLOBAL CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif !important; }
+
+.stApp {
+    background: linear-gradient(135deg,#0d0f1a 0%,#111827 60%,#0d0f1a 100%);
 }
 
-# ── In-memory job store ────────────────────────────────────────────────────────
-JOBS: dict = {}
+/* hero banner */
+.hero {
+    background: linear-gradient(135deg,rgba(99,102,241,.18),rgba(167,139,250,.10));
+    border: 1px solid rgba(99,102,241,.25);
+    border-radius: 20px;
+    padding: 32px 36px 24px;
+    margin-bottom: 24px;
+}
+.hero h1 {
+    font-size: 2.4rem; font-weight: 800;
+    background: linear-gradient(135deg,#e0e7ff,#a78bfa,#6366f1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; margin: 0 0 8px;
+}
+.hero p { color:#94a3b8; font-size:1rem; margin:0; }
+
+/* metric pill */
+.pill-row { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+.pill {
+    background:rgba(99,102,241,.12);
+    border:1px solid rgba(99,102,241,.25);
+    border-radius:30px;
+    padding:6px 16px;
+    font-size:.85rem; font-weight:600; color:#a78bfa;
+}
+
+/* candidate card */
+.ccard {
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:14px;
+    padding:16px 20px 12px;
+    margin-bottom:10px;
+    transition:border-color .2s,background .2s;
+}
+.ccard:hover { border-color:rgba(99,102,241,.35); background:rgba(99,102,241,.05); }
+.ccard.gold   { border-color:rgba(234,179,8,.30); background:rgba(234,179,8,.04); }
+.ccard.green  { border-color:rgba(34,197,94,.28); background:rgba(34,197,94,.04); }
+
+.rank-num { font-size:1.55rem; line-height:1; }
+.cname { font-size:1.05rem; font-weight:700; color:#e2e8f0; }
+.cmeta { font-size:.88rem; color:#94a3b8; margin:3px 0 8px; }
+.cbadge {
+    display:inline-block; padding:2px 9px; border-radius:20px;
+    font-size:.70rem; font-weight:700; letter-spacing:.04em;
+    text-transform:uppercase; margin-right:5px;
+}
+.b-fresh { background:rgba(34,197,94,.15); color:#4ade80; border:1px solid rgba(34,197,94,.3); }
+.b-top   { background:rgba(234,179,8,.15);  color:#fbbf24; border:1px solid rgba(234,179,8,.3); }
+.b-boost { background:rgba(99,102,241,.15); color:#a78bfa; border:1px solid rgba(99,102,241,.3); }
+
+/* progress bar row */
+.pbar-row { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+.pbar-label { color:#64748b; font-size:.75rem; min-width:72px; }
+.pbar-bg {
+    flex:1; background:rgba(255,255,255,.07);
+    border-radius:5px; height:6px; overflow:hidden;
+}
+.pbar-fill { height:6px; border-radius:5px; }
+.pbar-val { color:#94a3b8; font-size:.75rem; min-width:34px; text-align:right; }
+.score-big { font-size:1.1rem; font-weight:800; text-align:right; }
+
+/* skill chip */
+.chip {
+    display:inline-block; padding:3px 9px; border-radius:16px;
+    font-size:.76rem; font-weight:500; margin:2px;
+    background:rgba(99,102,241,.12); color:#a78bfa;
+    border:1px solid rgba(99,102,241,.22);
+}
+.chip.matched { background:rgba(34,197,94,.12); color:#4ade80; border-color:rgba(34,197,94,.28); }
+
+/* section divider */
+.sdiv { border:none; border-top:1px solid rgba(255,255,255,.07); margin:18px 0; }
+
+/* sidebar signal table */
+.sig-row {
+    display:flex; align-items:center; gap:8px;
+    padding:5px 0; border-bottom:1px solid rgba(255,255,255,.05);
+}
+.sig-icon { font-size:1rem; min-width:22px; }
+.sig-name { color:#e2e8f0; font-size:.82rem; font-weight:600; flex:1; }
+.sig-wt {
+    background:rgba(99,102,241,.18); color:#a78bfa;
+    border-radius:10px; padding:1px 8px; font-size:.78rem; font-weight:700;
+}
+.sig-desc { color:#64748b; font-size:.76rem; margin-top:1px; }
+</style>
+""", unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MULTI-FORMAT CANDIDATE PARSERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🎯 RedRob AI Ranker")
+    st.caption("Intelligent, explainable, fresher-friendly ranking")
+    st.divider()
 
-def _normalize_candidate(data: dict, idx: int) -> dict:
-    """
-    Map any dict (from CSV, Excel, PDF, JSON) to the expected candidate schema.
-    Fields that don't exist default gracefully — the scorer handles missing data.
-    """
-    # ── candidate_id ─────────────────────────────────────────────────────────
-    cid = (
-        data.get("candidate_id")
-        or data.get("id")
-        or data.get("ID")
-        or data.get("Candidate ID")
-        or data.get("CandidateID")
-        or f"CAND_{idx:06d}"
-    )
+    st.markdown("### 🧠 How Scoring Works")
+    st.info("**No ML model was trained.** Pure rule-based math — every score is auditable.", icon="ℹ️")
 
-    # ── profile block ─────────────────────────────────────────────────────────
-    profile = data.get("profile") or {}
-    if not isinstance(profile, dict):
-        profile = {}
+    st.markdown("**6 Scoring Signals:**")
+    signals_info = [
+        ("🎯", "Skill Match",     "35%", "JD skills found in candidate profile"),
+        ("📅", "Experience",      "25%", "YoE curve — freshers boosted"),
+        ("🎓", "Education",       "15%", "Institution tier + field + GPA"),
+        ("📋", "Completeness",    "10%", "Fields filled + GitHub / LinkedIn"),
+        ("📜", "Certifications",  "10%", "ML/AI upskilling evidence"),
+        ("🔍", "Keywords",         "5%", "Implicit JD mentions across full text"),
+    ]
+    for icon, name, weight, desc in signals_info:
+        st.markdown(
+            f'<div class="sig-row">'
+            f'<span class="sig-icon">{icon}</span>'
+            f'<span class="sig-name">{name}</span>'
+            f'<span class="sig-wt">{weight}</span>'
+            f'</div>'
+            f'<div style="color:#64748b;font-size:.74rem;padding:1px 0 4px 30px;">{desc}</div>',
+            unsafe_allow_html=True,
+        )
 
-    # Merge flat fields into profile if profile is empty/partial
-    def _first(*keys):
-        for k in keys:
-            v = data.get(k) or profile.get(k)
-            if v:
-                return str(v)
-        return ""
+    st.divider()
+    st.markdown("### 🌱 Fresher Boost")
+    st.markdown("""
+Candidates with **≤ 2 YoE** get up to **×1.30 bonus** for:
+- GitHub activity
+- Strong certifications
+- Top-tier institution
+- Good skill coverage
+""")
+    st.markdown("Dual-track guarantees **30 fresher slots** in the top 100.")
 
-    if not profile.get("anonymized_name"):
-        profile["anonymized_name"] = _first("name", "Name", "full_name", "FullName", "candidate_name")
-    if not profile.get("current_title"):
-        profile["current_title"] = _first("title", "Title", "current_title", "job_title", "JobTitle", "designation")
-    if not profile.get("current_company"):
-        profile["current_company"] = _first("company", "Company", "current_company", "employer", "Employer", "organization")
-    if not profile.get("location"):
-        profile["location"] = _first("location", "Location", "city", "City", "country")
+    st.divider()
+    st.markdown("### 📂 Accepted Formats")
+    st.markdown("""
+- **CSV** — Google Forms export
+- **Excel** — .xlsx / .xls
+- **JSON** — array of objects
+- **JSONL** — challenge format
+""")
+    st.markdown("**Auto-detects** 50+ column name variants — no setup needed.")
 
-    # YoE
-    yoe_raw = (
-        data.get("yoe")
-        or data.get("YoE")
-        or data.get("years_experience")
-        or data.get("YearsExperience")
-        or data.get("experience_years")
-        or profile.get("yoe_claimed")
-        or 0
-    )
-    try:
-        profile["yoe_claimed"] = float(str(yoe_raw).replace("+", "").strip() or 0)
-    except ValueError:
-        profile["yoe_claimed"] = 0.0
-
-    # ── skills ────────────────────────────────────────────────────────────────
-    raw_skills = data.get("skills") or data.get("Skills") or data.get("skill_set") or []
-    if isinstance(raw_skills, str):
-        # "Python, TensorFlow, SQL"
-        skill_list = [s.strip() for s in re.split(r"[,;|/]", raw_skills) if s.strip()]
-        raw_skills = [
-            {"name": s, "proficiency": "intermediate", "years_used": 1, "endorsements": 0}
-            for s in skill_list
-        ]
-    elif isinstance(raw_skills, list):
-        normalized = []
-        for s in raw_skills:
-            if isinstance(s, str):
-                normalized.append({"name": s, "proficiency": "intermediate",
-                                   "years_used": 1, "endorsements": 0})
-            elif isinstance(s, dict):
-                normalized.append(s)
-        raw_skills = normalized
-
-    # ── work_experience ───────────────────────────────────────────────────────
-    work_exp = data.get("work_experience") or data.get("experience") or data.get("WorkExperience") or []
-    if isinstance(work_exp, str):
-        work_exp = []  # Can't parse free text reliably
-    if not isinstance(work_exp, list):
-        work_exp = []
-
-    # ── education ─────────────────────────────────────────────────────────────
-    edu = data.get("education") or data.get("Education") or []
-    if isinstance(edu, str):
-        edu = [{"degree": edu, "field": "", "institution": "", "tier": "unknown"}]
-    if not isinstance(edu, list):
-        edu = []
-
-    # ── certifications ────────────────────────────────────────────────────────
-    certs = data.get("certifications") or data.get("Certifications") or []
-    if isinstance(certs, str):
-        certs = [{"name": c.strip()} for c in certs.split(",") if c.strip()]
-    if not isinstance(certs, list):
-        certs = []
-
-    # ── redrob_signals ────────────────────────────────────────────────────────
-    signals = data.get("redrob_signals") or {}
-    if not isinstance(signals, dict):
-        signals = {}
-    # Map flat columns into signals if present
-    for flat_key, sig_key in [
-        ("github_score", "github_activity_score"),
-        ("response_rate", "recruiter_response_rate"),
-        ("open_to_work", "open_to_work_flag"),
-        ("last_active", "last_active_date"),
-    ]:
-        flat_val = data.get(flat_key)
-        if flat_val is not None and sig_key not in signals:
-            signals[sig_key] = flat_val
-
-    return {
-        "candidate_id":   str(cid),
-        "profile":        profile,
-        "skills":         raw_skills,
-        "work_experience": work_exp,
-        "education":      edu,
-        "certifications": certs,
-        "redrob_signals": signals,
-    }
-
-
-def _parse_jsonl(path: str) -> list:
-    """Parse JSONL / TXT — one JSON object per line."""
-    candidates = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                # If it's already in the expected schema, pass through
-                if "candidate_id" in obj and "profile" in obj:
-                    candidates.append(obj)
-                else:
-                    candidates.append(_normalize_candidate(obj, i))
-            except json.JSONDecodeError:
-                pass  # skip malformed lines
-    return candidates
-
-
-def _parse_json(path: str) -> list:
-    """Parse JSON — array of candidate objects or single candidate."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        data = json.load(f)
-
-    if isinstance(data, list):
-        return [
-            obj if ("candidate_id" in obj and "profile" in obj)
-            else _normalize_candidate(obj, i)
-            for i, obj in enumerate(data)
-        ]
-    elif isinstance(data, dict):
-        # Single candidate or wrapper object
-        if "candidates" in data and isinstance(data["candidates"], list):
-            return [_normalize_candidate(c, i) for i, c in enumerate(data["candidates"])]
-        return [_normalize_candidate(data, 0)]
-    return []
-
-
-def _parse_csv_or_tsv(path: str, delimiter: str = ",") -> list:
-    """Parse CSV/TSV — each row becomes a candidate."""
-    candidates = []
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        reader = csv.DictReader(f, delimiter=delimiter)
-        for i, row in enumerate(reader):
-            # Convert OrderedDict to plain dict, strip whitespace from keys
-            clean = {k.strip(): v.strip() if isinstance(v, str) else v
-                     for k, v in row.items() if k}
-            candidates.append(_normalize_candidate(clean, i))
-    return candidates
-
-
-def _parse_excel(path: str) -> list:
-    """Parse XLSX/XLS — first sheet, each row becomes a candidate."""
-    import pandas as pd
-    df = pd.read_excel(path, sheet_name=0, dtype=str)
-    df = df.fillna("")
-    candidates = []
-    for i, row in enumerate(df.to_dict(orient="records")):
-        clean = {k.strip(): str(v).strip() for k, v in row.items() if k}
-        candidates.append(_normalize_candidate(clean, i))
-    return candidates
-
-
-def _parse_pdf(path: str) -> list:
-    """
-    Parse PDF — tries two strategies:
-    1. Extract JSONL lines from embedded text
-    2. Extract JSON blocks delimited by { }
-    3. Fallback: treat each detected 'Name / Title' block as a candidate
-    """
-    try:
-        import pdfplumber
-    except ImportError:
-        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
-
-    full_text = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text.append(t)
-
-    text = "\n".join(full_text)
-
-    # ── Strategy 1: JSONL lines in PDF ────────────────────────────────────────
-    candidates = []
-    for i, line in enumerate(text.splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                obj = json.loads(line)
-                candidates.append(
-                    obj if ("candidate_id" in obj and "profile" in obj)
-                    else _normalize_candidate(obj, i)
-                )
-                continue
-            except json.JSONDecodeError:
-                pass
-
-    if candidates:
-        return candidates
-
-    # ── Strategy 2: JSON blocks anywhere in text ───────────────────────────────
-    json_blocks = re.findall(r"\{[^{}]{20,}\}", text, re.DOTALL)
-    for i, block in enumerate(json_blocks):
-        try:
-            obj = json.loads(block)
-            candidates.append(_normalize_candidate(obj, i))
-        except json.JSONDecodeError:
-            pass
-
-    if candidates:
-        return candidates
-
-    # ── Strategy 3: Heuristic name-based parsing ───────────────────────────────
-    # Look for patterns like "Name: John | Title: ML Engineer"
-    entries = re.split(r"\n{2,}", text)
-    for i, entry in enumerate(entries):
-        if len(entry.strip()) < 10:
-            continue
-        candidate = {}
-        for pattern, key in [
-            (r"(?i)(?:name|candidate)[:\-]\s*(.+)", "name"),
-            (r"(?i)(?:title|designation|role)[:\-]\s*(.+)", "title"),
-            (r"(?i)(?:company|employer|org(?:anization)?)[:\-]\s*(.+)", "company"),
-            (r"(?i)(?:yoe|years?\s+of\s+exp)[:\-]\s*([\d\.]+)", "yoe"),
-            (r"(?i)(?:location|city)[:\-]\s*(.+)", "location"),
-            (r"(?i)(?:skills?)[:\-]\s*(.+)", "skills"),
-        ]:
-            m = re.search(pattern, entry)
-            if m:
-                candidate[key] = m.group(1).strip()
-        if candidate:
-            candidates.append(_normalize_candidate(candidate, i))
-
-    return candidates if candidates else []
-
-
-def load_candidates_multiformat(path: str) -> tuple[list, str]:
-    """
-    Detect file format by extension and parse accordingly.
-    Returns (candidates_list, format_name).
-    """
-    ext = Path(path).suffix.lower()
-    log.info(f"Parsing format: {ext!r} from {Path(path).name}")
-
-    if ext in (".jsonl", ".txt"):
-        return _parse_jsonl(path), "JSONL"
-    elif ext == ".json":
-        return _parse_json(path), "JSON"
-    elif ext == ".csv":
-        return _parse_csv_or_tsv(path, delimiter=","), "CSV"
-    elif ext == ".tsv":
-        return _parse_csv_or_tsv(path, delimiter="\t"), "TSV"
-    elif ext in (".xlsx", ".xls"):
-        return _parse_excel(path), "Excel"
-    elif ext == ".pdf":
-        return _parse_pdf(path), "PDF"
+    st.divider()
+    st.markdown("### ⚡ Cache Status")
+    if "cache_stats" in st.session_state:
+        cs = st.session_state["cache_stats"]
+        hit  = cs.get("hit", False)
+        icon = "⚡ Cache Hit" if hit else "⚙️ Computed"
+        color = "#22c55e" if hit else "#f59e0b"
+        st.markdown(
+            f'<div style="background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);'
+            f'border-radius:10px;padding:12px 14px;">>'
+            f'<div style="color:{color};font-weight:700;font-size:.9rem;">{icon}</div>'
+            f'<div style="color:#94a3b8;font-size:.78rem;margin-top:4px;">>'
+            f'Parse: {cs.get("parse_ms",0):.0f} ms<br>'
+            f'Rank: {cs.get("rank_ms",0):.0f} ms<br>'
+            f'Total: {cs.get("total_ms",0):.0f} ms'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
     else:
-        # Try JSONL as fallback
-        try:
-            return _parse_jsonl(path), "JSONL (auto)"
-        except Exception:
-            raise ValueError(f"Unsupported format: {ext}. Supported: JSONL, JSON, CSV, TSV, XLSX, XLS, PDF, TXT")
+        st.caption("Run a ranking to see cache stats.")
+
+    if st.button("🗑️ Clear Cache", use_container_width=True):
+        _cached_parse_bytes.clear()
+        _cached_parse_path.clear()
+        _cached_rank.clear()
+        if "cache_stats" in st.session_state:
+            del st.session_state["cache_stats"]
+        st.success("✅ Cache cleared.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STATIC FILE SERVING
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/")
-def index():
-    return send_from_directory(str(WEB_DIR), "index.html")
-
-@app.route("/<path:path>")
-def static_files(path):
-    return send_from_directory(str(WEB_DIR), path)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  API: START A RANKING JOB
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/api/rank", methods=["POST"])
-def api_rank():
-    """
-    POST /api/rank
-    Form fields:
-      use_default=true   → use ./dataset/candidates.jsonl on disk
-      file=<upload>      → any supported format file
-    Returns: { job_id, format, candidate_count_estimate }
-    """
-    job_id = str(uuid.uuid4())[:8]
-    use_default = request.form.get("use_default", "false").lower() == "true"
-    candidates_path = None
-    original_ext    = ".jsonl"
-    cleanup_after   = False
-
-    if use_default:
-        default_path = BASE_DIR / "dataset" / "candidates.jsonl"
-        if not default_path.exists():
-            return jsonify({"error": "dataset/candidates.jsonl not found on disk"}), 404
-        candidates_path = str(default_path)
-        original_ext    = ".jsonl"
-        log.info(f"[{job_id}] Using default dataset")
-
-    elif "file" in request.files and request.files["file"].filename:
-        f   = request.files["file"]
-        ext = Path(f.filename).suffix.lower()
-        if ext not in SUPPORTED_EXTENSIONS:
-            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-            return jsonify({"error": f"Unsupported format '{ext}'. Supported: {supported}"}), 400
-
-        tmp_path = BASE_DIR / f"_tmp_{job_id}{ext}"
-        f.save(str(tmp_path))
-        candidates_path = str(tmp_path)
-        original_ext    = ext
-        cleanup_after   = True
-        log.info(f"[{job_id}] Uploaded {ext!r} file: {f.filename} ({tmp_path.stat().st_size:,} bytes)")
-
-    else:
-        return jsonify({"error": "Provide a file or set use_default=true"}), 400
-
-    # Initialize job
-    JOBS[job_id] = {
-        "status":     "queued",
-        "progress":   0,
-        "message":    "Queued…",
-        "results":    None,
-        "error":      None,
-        "started_at": time.time(),
-        "total":      0,
-        "scored":     0,
-        "format":     original_ext,
-    }
-
-    t = threading.Thread(
-        target=_run_ranking,
-        args=(job_id, candidates_path, original_ext, cleanup_after),
-        daemon=True,
-    )
-    t.start()
-
-    return jsonify({"job_id": job_id, "format": original_ext})
+# ── HEADER ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="hero">
+  <h1>🎯 RedRob AI Candidate Ranker</h1>
+  <p>Upload candidate data in <strong>any format</strong> and get a ranked shortlist
+     with full, explainable reasoning — no APIs, no black boxes.</p>
+  <div class="pill-row">
+    <span class="pill">📂 CSV · Excel · JSON · JSONL</span>
+    <span class="pill">🧠 6-Signal Scoring</span>
+    <span class="pill">🌱 Fresher-Friendly</span>
+    <span class="pill">🔒 100% Offline</span>
+    <span class="pill">💾 Export CSV / JSON</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  BACKGROUND RANKING THREAD
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── INPUT ROW ──────────────────────────────────────────────────────────────────
+left_col, right_col = st.columns([1, 1], gap="large")
 
-def _run_ranking(job_id: str, candidates_path: str, ext: str, cleanup_after: bool):
-    """Load → parse format → parse JD → score → dual-track rank → store."""
-    job = JOBS[job_id]
-    try:
-        from jd_parser import parse_jd
-        from scorer import score_candidate
-        import numpy as np
+# Session-state initialisation (runs once)
+if "local_path_val" not in st.session_state:
+    st.session_state["local_path_val"] = ""
 
-        # ── Stage 1: Parse file ───────────────────────────────────────────────
-        job["status"]   = "loading"
-        job["message"]  = f"Parsing {ext.upper().lstrip('.')} file…"
-        job["progress"] = 3
+with left_col:
+    st.markdown("#### 📂 Candidate Data")
 
-        # For JSONL default, use the fast native loader
-        if ext == ".jsonl":
-            try:
-                from rank import load_candidates
-                candidates = load_candidates(candidates_path)
-                fmt = "JSONL"
-            except Exception:
-                candidates, fmt = load_candidates_multiformat(candidates_path)
+    tab_upload, tab_path = st.tabs(["⬆️ Upload File (small files)", "📁 Load from Path (large files)"])
+
+    uploaded_file = None
+    local_path    = None          # will be set below from session_state or text_input
+
+    with tab_upload:
+        st.caption("Best for CSV / Excel / JSON under ~100 MB")
+        uploaded_file = st.file_uploader(
+            "Drop your file here",
+            type=["csv", "xlsx", "xls", "json", "jsonl"],
+            help="Google Forms CSV, spreadsheet, JSON array or JSONL",
+            label_visibility="collapsed",
+        )
+        if uploaded_file:
+            st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB")
+
+    with tab_path:
+        st.caption("Use this for large files (400 MB+) already on your computer")
+
+        DEFAULT_JSONL = os.path.join(os.path.dirname(__file__), "dataset", "candidates.jsonl")
+
+        # ── Security: allowed extensions and base directories ──
+        ALLOWED_EXTS  = {'.csv', '.xlsx', '.xls', '.json', '.jsonl'}
+        ALLOWED_BASES = [
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Documents"),
+            "/tmp",
+        ]
+
+        def _safe_path(p):
+            """Return (ok, reason) — True only if ext and base dir are whitelisted."""
+            p = os.path.realpath(p)          # resolve symlinks / traversal
+            ext = os.path.splitext(p)[1].lower()
+            if ext not in ALLOWED_EXTS:
+                return False, f"File type `{ext}` not allowed. Use: {', '.join(sorted(ALLOWED_EXTS))}"
+            if not any(p.startswith(b) for b in ALLOWED_BASES):
+                return False, f"Path must be inside Desktop, Downloads, or Documents."
+            return True, ""
+
+        # One-click quick-fill button — stores path in session_state
+        if os.path.isfile(DEFAULT_JSONL):
+            if st.button("📂 Use challenge dataset  (candidates.jsonl — 465 MB)",
+                         use_container_width=True):
+                st.session_state["local_path_val"] = DEFAULT_JSONL
         else:
-            candidates, fmt = load_candidates_multiformat(candidates_path)
+            st.info("💡 **Local file path** is only available when running the app locally (not on Streamlit Cloud). Use the Upload File tab instead.", icon="ℹ️")
 
-        total = len(candidates)
-        if total == 0:
-            raise ValueError(
-                f"No candidates found in the {fmt} file. "
-                "Check that it contains valid candidate data."
-            )
+        # Text input — pre-filled from session_state so quick-fill works instantly
+        typed = st.text_input(
+            "Or paste any file path:",
+            value=st.session_state["local_path_val"],
+            placeholder=DEFAULT_JSONL,
+            key="path_text_input",
+        )
+        # Always sync typed value back to session_state
+        st.session_state["local_path_val"] = typed.strip()
 
-        job["total"]    = total
-        job["message"]  = f"Loaded {total:,} candidates from {fmt}"
-        job["progress"] = 12
-        log.info(f"[{job_id}] Loaded {total:,} candidates (format: {fmt})")
+        # Validate and expose
+        _raw_path = st.session_state["local_path_val"]
+        if _raw_path:
+            ok, reason = _safe_path(_raw_path)
+            if not ok:
+                st.error(f"❌ {reason}")
+                local_path = None
+            elif os.path.isfile(os.path.realpath(_raw_path)):
+                size_mb = os.path.getsize(_raw_path) / 1024 / 1024
+                st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
+                local_path = os.path.realpath(_raw_path)   # canonical safe path
+            else:
+                st.error(f"❌ File not found:\n`{_raw_path}`")
+                local_path = None
+        else:
+            local_path = None
 
-        # ── Stage 2: Parse JD ─────────────────────────────────────────────────
-        job["status"]   = "parsing"
-        job["message"]  = "Parsing Job Description…"
-        job["progress"] = 15
 
-        req = parse_jd()
-        job["progress"] = 18
-        log.info(f"[{job_id}] JD parsed: {len(req.critical_skills)} critical skills")
+with right_col:
+    st.markdown("#### 📝 Job Description")
+    DEFAULT_JD = """Software / AI Engineer (General Tech Hiring)
 
-        # ── Stage 3: Score ────────────────────────────────────────────────────
-        job["status"]  = "scoring"
-        job["message"] = f"Scoring {total:,} candidates…"
+We are hiring across engineering, data, AI, and product roles.
 
-        all_results         = []
-        fresher_results     = []
-        experienced_results = []
-        t0    = time.time()
-        BATCH = max(1, min(2000, total // 20 or 500))
+Core Skills Required:
+- Python or Java or JavaScript or Go
+- REST APIs, Microservices, SQL
+- Cloud platforms: AWS or Azure or GCP
+- Agile / Scrum methodologies
+- Problem-solving and system design
 
-        for i, candidate in enumerate(candidates):
+Preferred / Additional Skills:
+- Machine learning, NLP, or data science
+- DevOps: Docker, Kubernetes, CI/CD
+- Frontend: React, TypeScript
+- Data engineering: Spark, Kafka, Hadoop
+- Mobile: Android or iOS development
+
+Education: Any engineering or CS background
+Experience: 0–10 years (freshers welcome)
+Location: India preferred, open to remote"""
+
+    jd_text = st.text_area(
+        "Job Description",
+        value=DEFAULT_JD,
+        height=260,
+        label_visibility="collapsed",
+    )
+
+# ── RUN BUTTON ─────────────────────────────────────────────────────────────────
+st.markdown("")
+btn_col, _ = st.columns([1, 4])
+with btn_col:
+    run_btn = st.button("🚀 Rank Candidates", type="primary", use_container_width=True)
+
+
+# ── RESULTS ────────────────────────────────────────────────────────────────────
+has_file = (uploaded_file is not None) or bool(local_path)
+
+if run_btn and has_file and jd_text.strip():
+
+    _t_total_start = time.perf_counter()
+    _parse_ms = _rank_ms = 0
+    _from_cache = True          # assume cache hit; set False if we compute
+
+    with st.spinner("⚡ Loading from cache or computing…"):
+
+        if uploaded_file is not None:
+            # ── browser upload ──
+            raw   = uploaded_file.read()
+            fname = uploaded_file.name
+            _t0 = time.perf_counter()
             try:
-                result = score_candidate(candidate, req)
-                all_results.append(result)
-                yoe = result.get("yoe", 99)
-                (fresher_results if yoe <= 2 else experienced_results).append(result)
-            except Exception as e:
-                cid = candidate.get("candidate_id", f"UNKNOWN_{i}")
-                all_results.append({
-                    "candidate_id":     str(cid),
-                    "final_score":      0.0,
-                    "reasoning":        f"Scoring error: {str(e)[:100]}",
-                    "name": str(candidate.get("profile", {}).get("anonymized_name", "")),
-                    "title": "", "company": "", "yoe": 99,
-                    "skill_score": 0, "career_score": 0, "experience_score": 0,
-                    "education_score": 0, "behavioral_score": 0,
-                    "location_score": 0, "penalty_multiplier": 1,
-                })
+                candidates = _cached_parse_bytes.__wrapped__(raw, fname)   # test cache
+            except AttributeError:
+                pass
+            _t0 = time.perf_counter()
+            candidates  = _cached_parse_bytes(raw, fname)
+            _parse_ms   = (time.perf_counter() - _t0) * 1000
+            _has_progress = False
 
-            if (i + 1) % BATCH == 0 or i == total - 1:
-                elapsed   = max(time.time() - t0, 0.001)
-                rate      = (i + 1) / elapsed
-                remaining = (total - i - 1) / max(rate, 1)
-                pct = 18 + int(((i + 1) / total) * 70)
-                job["progress"] = pct
-                job["scored"]   = i + 1
-                job["message"]  = (
-                    f"Scored {i+1:,}/{total:,} "
-                    f"({rate:.0f}/s · ~{int(remaining)}s remaining)"
-                )
+        else:
+            # ── local file path ──
+            fname  = os.path.basename(local_path)
+            stat   = os.stat(local_path)
+            _mtime = stat.st_mtime
+            _size  = stat.st_size
 
-        # ── Stage 4: Dual-track ranking ───────────────────────────────────────
-        job["status"]   = "ranking"
-        job["message"]  = "Building dual-track ranking…"
-        job["progress"] = 90
+            progress_bar  = st.progress(0, text="⚡ Checking cache / reading file…")
+            _has_progress = True
 
-        experienced_results.sort(key=lambda r: (-r["final_score"], r["candidate_id"]))
-        fresher_results.sort(key=lambda r:     (-r["final_score"], r["candidate_id"]))
+            _t0        = time.perf_counter()
+            candidates = _cached_parse_path(local_path, _mtime, _size, fname)
+            _parse_ms  = (time.perf_counter() - _t0) * 1000
 
-        top_exp    = experienced_results[:70]
-        top_fresh  = fresher_results[:30]
-        combined   = sorted(top_exp + top_fresh, key=lambda r: (-r["final_score"], r["candidate_id"]))
-        top100     = combined[:100]
+            progress_bar.progress(70, text="🤖 Ranking candidates…")
 
-        for r in top100:
-            r["track"] = "fresher" if r.get("yoe", 99) <= 2 else "experienced"
+        if not candidates:
+            st.error("❌ Could not parse the file. Check the format and try again.")
+            st.stop()
 
-        all_scores = [r["final_score"] for r in all_results]
-        stats = {
-            "total_candidates":    total,
-            "format":              fmt,
-            "freshers_in_top100":  sum(1 for r in top100 if r.get("yoe", 99) <= 2),
-            "avg_score_top100":    round(float(np.mean([r["final_score"] for r in top100])), 4) if top100 else 0,
-            "max_score":           round(float(np.max(all_scores)),            4) if all_scores else 0,
-            "p99_score":           round(float(np.percentile(all_scores, 99)), 4) if all_scores else 0,
-            "p50_score":           round(float(np.percentile(all_scores, 50)), 4) if all_scores else 0,
-            "runtime_seconds":     round(time.time() - t0, 1),
+        # ── Serialise for rank cache key ──
+        cands_json = _serialise_candidates(candidates)
+
+        _t0          = time.perf_counter()
+        ranked, jd_skills = _cached_rank(cands_json, jd_text)
+        _rank_ms     = (time.perf_counter() - _t0) * 1000
+
+        _total_ms = (time.perf_counter() - _t_total_start) * 1000
+
+        # Detect cache hit: very fast (<50ms) almost certainly came from cache
+        _from_cache = (_parse_ms + _rank_ms) < 50
+
+        st.session_state["cache_stats"] = {
+            "hit":      _from_cache,
+            "parse_ms": _parse_ms,
+            "rank_ms":  _rank_ms,
+            "total_ms": _total_ms,
         }
 
-        job["results"]  = {"top100": top100, "stats": stats}
-        job["status"]   = "done"
-        job["progress"] = 100
-        job["message"]  = (
-            f"Done! Ranked {total:,} from {fmt} "
-            f"in {stats['runtime_seconds']}s"
+        if _has_progress:
+            progress_bar.progress(100, text="✅ Done — ranked!")
+
+    # ── Cache hit badge ──
+    if _from_cache:
+        st.success("⚡ **Results served from cache** — instant! (no recompute)")
+    else:
+        st.info(f"⚙️ Computed in **{_total_ms:.0f} ms** — result now cached for next run.")
+
+
+    # ── STATS ─────────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("## 📊 Ranking Complete")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Candidates", f"{len(ranked):,}")
+    m2.metric("Top Score",  f"{ranked[0]['final_score']:.3f}" if ranked else "—")
+    m3.metric("Avg Score",  f"{sum(r['final_score'] for r in ranked)/max(1,len(ranked)):.3f}")
+    m4.metric("Freshers 🌱", sum(1 for r in ranked if r["is_fresher"]))
+    m5.metric("JD Skills",  len(jd_skills))
+
+    # ── JD SKILLS CHIPS ───────────────────────────────────────────
+    with st.expander("🔍 Skills extracted from Job Description", expanded=False):
+        chip_html = "".join(
+            f'<span class="chip">{s}</span>' for s in jd_skills[:50]
         )
-        log.info(f"[{job_id}] Complete: {total:,} candidates, {stats['runtime_seconds']}s")
+        st.markdown(chip_html, unsafe_allow_html=True)
+        st.caption(f"{len(jd_skills)} skills identified from the job description text.")
 
-    except Exception as e:
-        job["status"]  = "error"
-        job["error"]   = str(e)
-        job["message"] = f"Error: {str(e)[:200]}"
-        log.exception(f"[{job_id}] Failed: {e}")
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
 
-    finally:
-        if cleanup_after and os.path.exists(candidates_path):
-            os.unlink(candidates_path)
+    # ── RANKED LIST ───────────────────────────────────────────────
+    st.markdown("## 🏆 Ranked Candidates")
 
+    RANK_EMOJI = {1: "🥇", 2: "🥈", 3: "🥉"}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  API: POLL STATUS
-# ═══════════════════════════════════════════════════════════════════════════════
+    def score_bar_color(score):
+        if score >= 0.75: return "#22c55e"
+        if score >= 0.55: return "#6366f1"
+        if score >= 0.35: return "#f59e0b"
+        return "#ef4444"
 
-@app.route("/api/status/<job_id>")
-def api_status(job_id):
-    job = JOBS.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
+    def pct_str(score):
+        return f"{score*100:.0f}%"
 
-    resp = {
-        "status":   job["status"],
-        "progress": job["progress"],
-        "message":  job["message"],
-        "total":    job["total"],
-        "scored":   job["scored"],
-    }
-    if job["status"] == "done":
-        resp["results"] = job["results"]
-    elif job["status"] == "error":
-        resp["error"] = job["error"]
+    for r in ranked:
+        rank = r["rank"]
+        is_fresh = r["is_fresher"]
+        is_top3  = rank <= 3
 
-    return jsonify(resp)
+        card_class = "gold" if is_top3 else ("green" if is_fresh else "")
+        rank_label = RANK_EMOJI.get(rank, f"#{rank}")
 
+        # badges
+        badges = ""
+        if is_top3:
+            badges += '<span class="cbadge b-top">⭐ Top 3</span>'
+        if is_fresh:
+            badges += '<span class="cbadge b-fresh">🌱 Fresher</span>'
+        if r["fresher_uplift"] > 1.0:
+            badges += f'<span class="cbadge b-boost">×{r["fresher_uplift"]:.2f} Boost</span>'
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  API: DOWNLOAD CSV
-# ═══════════════════════════════════════════════════════════════════════════════
+        # meta line
+        # ── XSS protection: escape ALL user-supplied data before HTML rendering ──
+        name     = html_mod.escape(r.get("name") or r.get("candidate_id", "—"))
+        title    = html_mod.escape(r.get("title", ""))
+        company  = html_mod.escape(r.get("company", ""))
+        location = html_mod.escape(r.get("location", ""))
+        yoe_val  = r.get("yoe", "")
 
-@app.route("/api/download/<job_id>")
-def api_download(job_id):
-    job = JOBS.get(job_id)
-    if not job or job["status"] != "done":
-        return jsonify({"error": "Results not ready"}), 404
+        meta_parts = []
+        if title:   meta_parts.append(title)
+        if company: meta_parts.append(f"@ {company}")
+        if yoe_val is not None and yoe_val != "": meta_parts.append(f"• {yoe_val} YoE")
+        if location: meta_parts.append(f"• 📍 {location}")
+        meta_str = "  ".join(meta_parts)
 
-    top100 = job["results"]["top100"]
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["candidate_id", "rank", "score", "reasoning"])
+        # signal mini-bars (HTML)
+        bar_color = score_bar_color(r["final_score"])
+        signals_html = ""
+        for sig_name, sig_key, sig_color in [
+            ("Skill",  "skill_score",          "#6366f1"),
+            ("Exp",    "experience_score",      "#22c55e"),
+            ("Edu",    "education_score",       "#f59e0b"),
+            ("Certs",  "certification_score",   "#a78bfa"),
+        ]:
+            sv = r.get(sig_key, 0)
+            signals_html += (
+                f'<div class="pbar-row">'
+                f'<span class="pbar-label">{sig_name}</span>'
+                f'<div class="pbar-bg"><div class="pbar-fill" '
+                f'style="width:{pct_str(sv)};background:{sig_color};"></div></div>'
+                f'<span class="pbar-val">{pct_str(sv)}</span>'
+                f'</div>'
+            )
 
-    scores = [r["final_score"] for r in top100]
-    for i in range(1, len(scores)):
-        if scores[i] > scores[i - 1]:
-            scores[i] = scores[i - 1]
+        card_html = f"""
+<div class="ccard {card_class}">
+  <div style="display:flex;gap:16px;align-items:flex-start;">
+    <div style="min-width:48px;text-align:center;padding-top:2px;">
+      <div class="rank-num">{rank_label}</div>
+    </div>
+    <div style="flex:1;min-width:0;">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+        <span class="cname">{name}</span>
+        {badges}
+      </div>
+      <div class="cmeta">{meta_str}</div>
+      {signals_html}
+    </div>
+    <div style="min-width:64px;text-align:right;">
+      <div class="score-big" style="color:{bar_color};">{r['final_score']:.4f}</div>
+      <div style="color:#64748b;font-size:.72rem;margin-top:2px;">Score</div>
+    </div>
+  </div>
+</div>
+"""
+        st.markdown(card_html, unsafe_allow_html=True)
 
-    for rank_idx, (result, adj_score) in enumerate(zip(top100, scores)):
-        reasoning = result.get("reasoning", "").replace("\n", " ").replace("\r", " ")
-        writer.writerow([result["candidate_id"], rank_idx + 1, f"{adj_score:.6f}", reasoning])
+        # Expandable breakdown
+        with st.expander(f"📋 Why #{rank}? — Full scoring breakdown"):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**Signal Breakdown**")
+                sigs = [
+                    ("🎯 Skill Match",    r["skill_score"],          "#6366f1"),
+                    ("📅 Experience",     r["experience_score"],     "#22c55e"),
+                    ("🎓 Education",      r["education_score"],      "#f59e0b"),
+                    ("📋 Completeness",   r["completeness_score"],   "#94a3b8"),
+                    ("📜 Certifications", r["certification_score"],  "#a78bfa"),
+                    ("🔍 Keywords",       r["keyword_score"],        "#64748b"),
+                ]
+                for sig_label, sig_val, sig_col in sigs:
+                    filled = int(sig_val * 20)
+                    bar_s  = "█" * filled + "░" * (20 - filled)
+                    st.markdown(
+                        f'{sig_label}: <code style="color:{sig_col}">{bar_s}</code> '
+                        f'`{sig_val:.3f}`',
+                        unsafe_allow_html=True,
+                    )
+                if r["fresher_uplift"] > 1.0:
+                    st.success(f"🚀 Fresher Boost applied: ×{r['fresher_uplift']:.3f}")
 
-    output.seek(0)
-    resp = make_response(output.getvalue())
-    resp.headers["Content-Disposition"] = f"attachment; filename=submission_{job_id}.csv"
-    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-    return resp
+            with col_b:
+                st.markdown("**Reasoning**")
+                for chunk in r.get("reasoning", "").split(" || "):
+                    if ":" in chunk:
+                        tag, _, detail = chunk.partition(": ")
+                        st.markdown(f"**{tag}**: {detail}")
 
+    # ── DOWNLOAD ──────────────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("### 💾 Download Results")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  API: SUPPORTED FORMATS (for UI)
-# ═══════════════════════════════════════════════════════════════════════════════
+    rows = [{
+        "rank": r["rank"], "candidate_id": r["candidate_id"],
+        "name": r.get("name",""), "title": r.get("title",""),
+        "company": r.get("company",""), "location": r.get("location",""),
+        "yoe": r.get("yoe",""), "is_fresher": r["is_fresher"],
+        "final_score": r["final_score"],
+        "skill_score": r["skill_score"], "experience_score": r["experience_score"],
+        "education_score": r["education_score"], "completeness_score": r["completeness_score"],
+        "certification_score": r["certification_score"], "keyword_score": r["keyword_score"],
+        "fresher_uplift": r["fresher_uplift"],
+        "skill_match_detail": r["skill_match_detail"],
+        "experience_detail": r["experience_detail"],
+        "education_detail": r["education_detail"],
+        "certification_detail": r["certification_detail"],
+        "reasoning": r["reasoning"],
+    } for r in ranked]
 
-@app.route("/api/formats")
-def api_formats():
-    return jsonify({
-        "formats": [
-            {"ext": ".jsonl", "label": "JSONL",  "desc": "Primary format — one JSON per line",  "icon": "{}"},
-            {"ext": ".json",  "label": "JSON",   "desc": "JSON array of candidate objects",      "icon": "[]"},
-            {"ext": ".csv",   "label": "CSV",    "desc": "Comma-separated values — columns auto-mapped", "icon": "⊞"},
-            {"ext": ".xlsx",  "label": "Excel",  "desc": "Excel workbook — first sheet",         "icon": "⊞"},
-            {"ext": ".xls",   "label": "Excel",  "desc": "Legacy Excel workbook",                "icon": "⊞"},
-            {"ext": ".pdf",   "label": "PDF",    "desc": "PDF with embedded candidate data",     "icon": "📄"},
-            {"ext": ".txt",   "label": "TXT",    "desc": "Plain text treated as JSONL",          "icon": "≡"},
-            {"ext": ".tsv",   "label": "TSV",    "desc": "Tab-separated values",                 "icon": "⊞"},
-        ]
-    })
+    df_exp = pd.DataFrame(rows)
+    dc1, dc2, _ = st.columns([1, 1, 2])
+    with dc1:
+        st.download_button("⬇️ Download CSV",
+            df_exp.to_csv(index=False).encode(),
+            "ranked_candidates.csv", "text/csv",
+            use_container_width=True)
+    with dc2:
+        st.download_button("⬇️ Download JSON",
+            json.dumps(rows, indent=2, default=str).encode(),
+            "ranked_candidates.json", "application/json",
+            use_container_width=True)
 
+    with st.expander("📊 View as Table"):
+        st.dataframe(df_exp[[
+            "rank","name","title","company","yoe","is_fresher",
+            "final_score","skill_score","experience_score","education_score",
+        ]].rename(columns={
+            "rank":"Rank","name":"Name","title":"Title","company":"Company",
+            "yoe":"YoE","is_fresher":"Fresher?","final_score":"Score",
+            "skill_score":"Skill","experience_score":"Exp","education_score":"Edu",
+        }), hide_index=True, use_container_width=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+elif run_btn and not has_file:
+    st.warning("⚠️ Please upload a file or paste a file path first.")
+elif run_btn and not jd_text.strip():
+    st.warning("⚠️ Please enter a job description before ranking.")
+else:
+    # ── GETTING STARTED ───────────────────────────────────────────
+    st.markdown("<hr class='sdiv'>", unsafe_allow_html=True)
+    st.markdown("### 👋 Getting Started")
+    ga, gb = st.columns(2)
+    with ga:
+        st.markdown("**Sample Google Forms CSV columns:**")
+        st.dataframe(pd.DataFrame({
+            "Your Name":             ["Priya Sharma",  "Rahul Mehta"],
+            "Years of Experience":   ["0",             "5"],
+            "Technical Skills":      ["Python, PyTorch, NLP", "Python, FAISS, MLOps"],
+            "College / University":  ["IIT Bombay",    "NIT Trichy"],
+            "CGPA / Percentage":     ["9.2 CGPA",      "75%"],
+            "Certifications":        ["DeepLearning.AI", "AWS ML Specialty"],
+            "GitHub Profile":        ["github.com/ps", "github.com/rm"],
+        }), hide_index=True, use_container_width=True)
 
-if __name__ == "__main__":
-    log.info("=" * 55)
-    log.info("  RedRob AI Ranker — Web Server (Multi-Format)")
-    log.info(f"  Serving from: {WEB_DIR}")
-    log.info("  Supported: JSONL, JSON, CSV, TSV, XLSX, XLS, PDF, TXT")
-    log.info("  → http://localhost:8765")
-    log.info("=" * 55)
-    app.run(host="0.0.0.0", port=8765, debug=False, threaded=True)
+    with gb:
+        st.markdown("**What you'll get per candidate:**")
+        st.markdown("""
+- 🏆 **Final rank** (1–N) with composite score
+- 🎯 **Skill match %** — which JD skills were found
+- 📅 **Experience score** — YoE curve with fresher boost
+- 🎓 **Education score** — institution tier + GPA
+- 📜 **Certification score** — ML upskilling signals
+- 📋 **Full reasoning** — every score explained in plain text
+- 💾 **Downloadable** CSV + JSON output
+""")
+        st.info("The system auto-detects column names — no manual mapping needed.", icon="✨")
