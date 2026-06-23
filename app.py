@@ -191,13 +191,17 @@ st.markdown("""
 # ── INPUT ROW ──────────────────────────────────────────────────────────────────
 left_col, right_col = st.columns([1, 1], gap="large")
 
+# Session-state initialisation (runs once)
+if "local_path_val" not in st.session_state:
+    st.session_state["local_path_val"] = ""
+
 with left_col:
     st.markdown("#### 📂 Candidate Data")
 
     tab_upload, tab_path = st.tabs(["⬆️ Upload File (small files)", "📁 Load from Path (large files)"])
 
     uploaded_file = None
-    local_path    = None
+    local_path    = None          # will be set below from session_state or text_input
 
     with tab_upload:
         st.caption("Best for CSV / Excel / JSON under ~100 MB")
@@ -212,32 +216,38 @@ with left_col:
 
     with tab_path:
         st.caption("Use this for large files (400 MB+) already on your computer")
-        local_path = st.text_input(
-            "Full file path",
-            placeholder="/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl",
-            label_visibility="collapsed",
+
+        DEFAULT_JSONL = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
+
+        # One-click quick-fill button — stores path in session_state
+        if os.path.isfile(DEFAULT_JSONL):
+            if st.button("📂 Use challenge dataset  (candidates.jsonl — 465 MB)",
+                         use_container_width=True):
+                st.session_state["local_path_val"] = DEFAULT_JSONL
+
+        # Text input — pre-filled from session_state so quick-fill works instantly
+        typed = st.text_input(
+            "Or paste any file path:",
+            value=st.session_state["local_path_val"],
+            placeholder=DEFAULT_JSONL,
+            key="path_text_input",
         )
-        if local_path:
-            if os.path.isfile(local_path):
-                size_mb = os.path.getsize(local_path) / 1024 / 1024
-                st.success(f"✅ Found: **{os.path.basename(local_path)}** — {size_mb:.1f} MB")
+        # Always sync typed value back to session_state
+        st.session_state["local_path_val"] = typed.strip()
+
+        # Validate and expose
+        _raw_path = st.session_state["local_path_val"]
+        if _raw_path:
+            if os.path.isfile(_raw_path):
+                size_mb = os.path.getsize(_raw_path) / 1024 / 1024
+                st.success(f"✅ Ready: **{os.path.basename(_raw_path)}** — {size_mb:.1f} MB")
+                local_path = _raw_path          # ← valid path confirmed
             else:
-                st.error("❌ File not found. Check the path and try again.")
-                local_path = None
+                st.error(f"❌ File not found:\n`{_raw_path}`\nCheck the path and try again.")
+                local_path = None               # ← invalid, block ranking
+        else:
+            local_path = None                   # ← nothing typed, block ranking
 
-        # Quick-fill button for the challenge dataset
-        default_jsonl = "/Users/dsanthoshkumar/Desktop/redrobs-ranker/dataset/candidates.jsonl"
-        if os.path.isfile(default_jsonl):
-            if st.button("📂 Use challenge dataset (candidates.jsonl)", use_container_width=True):
-                st.session_state["local_path_val"] = default_jsonl
-                st.rerun()
-        if "local_path_val" in st.session_state and not local_path:
-            local_path = st.session_state["local_path_val"]
-            size_mb = os.path.getsize(local_path) / 1024 / 1024
-            st.success(f"✅ Loaded: **candidates.jsonl** — {size_mb:.1f} MB")
-
-    if uploaded_file:
-        st.success(f"✅ **{uploaded_file.name}** — {uploaded_file.size/1024/1024:.1f} MB loaded")
 
 with right_col:
     st.markdown("#### 📝 Job Description")
@@ -278,7 +288,7 @@ with btn_col:
 
 
 # ── RESULTS ────────────────────────────────────────────────────────────────────
-has_file = uploaded_file is not None or (local_path is not None)
+has_file = (uploaded_file is not None) or bool(local_path)
 
 if run_btn and has_file and jd_text.strip():
     with st.spinner("⚙️ Parsing file and scoring candidates…"):
