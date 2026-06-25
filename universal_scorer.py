@@ -217,34 +217,34 @@ def score_skill_match(candidate: Dict, jd_skills: List[str]) -> Tuple[float, str
 
 
 def score_experience_fit(candidate: Dict) -> Tuple[float, str]:
-    """SIGNAL 2: YoE curve — fresher-skewed."""
+    """SIGNAL 2: Balanced YoE curve — values both freshers AND experienced."""
     raw_yoe = candidate.get("yoe", "0")
     yoe = _parse_yoe(str(raw_yoe))
 
     if yoe == 0:
-        base = 0.65
+        base = 0.60
         tag = "Fresher (0 YoE) — potential-based"
     elif yoe <= 1:
-        base = 0.70
+        base = 0.65
         tag = f"Entry-level ({yoe:.1f} YoE)"
     elif yoe <= 2:
         base = 0.72
         tag = f"Junior ({yoe:.1f} YoE)"
     elif yoe <= 4:
-        base = 0.78
-        tag = f"Early mid-level ({yoe:.1f} YoE)"
-    elif yoe <= 6:
         base = 0.85
-        tag = f"Mid-level ({yoe:.1f} YoE)"
-    elif yoe <= 9:
-        base = 0.82
+        tag = f"Early mid-level ({yoe:.1f} YoE)"
+    elif yoe <= 7:
+        base = 1.00
+        tag = f"Mid-level ({yoe:.1f} YoE) — prime range"
+    elif yoe <= 10:
+        base = 0.92
         tag = f"Senior ({yoe:.1f} YoE)"
-    elif yoe <= 12:
-        base = 0.72
-        tag = f"Senior+ ({yoe:.1f} YoE) — slight over-exp"
+    elif yoe <= 15:
+        base = 0.78
+        tag = f"Senior+ ({yoe:.1f} YoE)"
     else:
-        base = 0.60
-        tag = f"Over-experienced ({yoe:.1f} YoE) — penalized"
+        base = 0.62
+        tag = f"Very senior ({yoe:.1f} YoE) — likely over-qualified for entry roles"
 
     return _clamp(base), tag
 
@@ -455,18 +455,19 @@ def score_candidate(candidate: Dict, jd_text: str, jd_skills: List[str]) -> Dict
         kw_score       * WEIGHTS["keyword_density"]
     )
 
-    # Fresher uplift — if YoE <= 2, high-signal freshers get boosted
+    # Fresher uplift — modest boost for high-signal freshers only
     yoe = _parse_yoe(str(candidate.get("yoe", "0")))
     fresher_uplift = 1.0
     if yoe <= 2:
         potential = 0
-        if skill_score >= 0.3:  potential += 2
-        if edu_score >= 0.6:    potential += 2
-        if comp_score >= 0.6:   potential += 1
-        if cert_score >= 0.5:   potential += 2
-        if yoe == 0:            potential += 1
-        fresher_uplift = 1.0 + min(0.30, potential * 0.05)
-        composite = min(0.92, composite * fresher_uplift)
+        if skill_score >= 0.45:  potential += 2   # raised bar — needs strong skill match
+        if edu_score  >= 0.65:   potential += 2   # raised bar — needs strong education
+        if comp_score >= 0.65:   potential += 1
+        if cert_score >= 0.55:   potential += 2
+        if yoe == 0:             potential += 1
+        # Cap at ×1.15 (was ×1.30) — uplift assists but doesn't dominate
+        fresher_uplift = 1.0 + min(0.15, potential * 0.03)
+        composite = min(0.90, composite * fresher_uplift)
 
     final_score = _clamp(composite)
 
@@ -519,41 +520,18 @@ def score_candidate(candidate: Dict, jd_text: str, jd_skills: List[str]) -> Dict
 def rank_candidates(candidates: List[Dict], jd_text: str) -> List[Dict]:
     """
     Score and rank all candidates. Returns sorted list (best first).
-    Applies fresher dual-track: guarantees freshers in final list.
+    Pure score-based ranking — no forced quotas.
+    Freshers rise on merit: strong skills + education + certs = high score.
     """
     jd_skills = _extract_skills_from_jd(jd_text)
 
-    all_scored = []
-    freshers = []
-    experienced = []
+    all_scored = [score_candidate(c, jd_text, jd_skills) for c in candidates]
 
-    for c in candidates:
-        result = score_candidate(c, jd_text, jd_skills)
-        all_scored.append(result)
-        if result["is_fresher"]:
-            freshers.append(result)
-        else:
-            experienced.append(result)
-
-    # Sort each track
-    experienced.sort(key=lambda r: -r["final_score"])
-    freshers.sort(key=lambda r: -r["final_score"])
-
-    # Dual-track: up to 30% fresher slots
-    n = len(all_scored)
-    if n <= 10:
-        # Small dataset — just sort by score
-        all_scored.sort(key=lambda r: -r["final_score"])
-        ranked = all_scored
-    else:
-        fresher_quota = max(1, min(len(freshers), n // 3))
-        exp_quota = n - fresher_quota
-        combined = experienced[:exp_quota] + freshers[:fresher_quota]
-        combined.sort(key=lambda r: -r["final_score"])
-        ranked = combined
+    # Pure merit sort — score decides everything
+    all_scored.sort(key=lambda r: -r["final_score"])
 
     # Assign ranks
-    for i, r in enumerate(ranked):
+    for i, r in enumerate(all_scored):
         r["rank"] = i + 1
 
-    return ranked, jd_skills
+    return all_scored, jd_skills
