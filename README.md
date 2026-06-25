@@ -10,7 +10,7 @@
 A fully offline, no-API, multi-signal candidate ranking system with a beautiful web UI. Upload candidate data in **any format** (Google Forms CSV, Excel, JSON) and get a ranked shortlist with full reasoning for every candidate.
 
 ---
-Live at: https://ai-resume-ranke.streamlit.app
+Live at: https://redrob-ai-ranker-mqvnsve2xfnzpqpyaiqspw.streamlit.app
 
 ## ✨ Features
 
